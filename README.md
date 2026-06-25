@@ -60,3 +60,7 @@ journalctl -u ship-driver -f
 
 The apt repo is currently **unsigned** (`[trusted=yes]`). To add GPG signing later, sign
 `Release` in the workflow and ship the public key.
+
+## License
+
+[MIT](LICENSE) © 2026 Ilya Koptev
