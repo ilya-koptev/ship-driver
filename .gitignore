@@ -1,0 +1,5 @@
+pkg/
+repo/
+*.deb
+Packages*
+Release

@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+# Migrate from a manual install if present (old paths)
+if [ -f /etc/systemd/system/ship-driver.service ]; then rm -f /etc/systemd/system/ship-driver.service; fi
+if [ -f /usr/local/bin/ship-driver.py ]; then rm -f /usr/local/bin/ship-driver.py; fi
+systemctl daemon-reload || true
+systemctl enable ship-driver.service || true
+systemctl restart ship-driver.service || true
+exit 0

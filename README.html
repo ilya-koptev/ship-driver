@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Драйвер корабля — ship-driver</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.5;color:#1c2330;
+       max-width:980px;margin:0 auto;padding:24px;background:#f7f9fc}
+  h1{font-size:26px;margin:0 0 4px}
+  h2{font-size:20px;margin:30px 0 10px;border-bottom:2px solid #d6e0ee;padding-bottom:6px;color:#13315c}
+  .sub{color:#5a6b85;margin:0 0 18px}
+  table{border-collapse:collapse;width:100%;margin:10px 0;background:#fff;font-size:14px}
+  th,td{border:1px solid #cfdaea;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#13315c;color:#fff;font-weight:600}
+  tbody tr:nth-child(even){background:#eef3fa}
+  td.c,th.c{text-align:center}
+  code{background:#eceff4;padding:1px 5px;border-radius:4px;font-size:13px}
+  pre{background:#1c2330;color:#e6edf6;padding:14px;border-radius:8px;overflow-x:auto;font-size:13px}
+  .modes li{margin:6px 0}
+  .badge{display:inline-block;background:#13315c;color:#fff;border-radius:5px;padding:1px 8px;font-size:13px;font-weight:600}
+  .note{background:#fff7e6;border-left:4px solid #e0a800;padding:10px 14px;border-radius:4px;margin:12px 0}
+  .scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>Драйвер корабля — <code>ship-driver</code></h1>
+<p class="sub">Кастомный драйвер корабельной шины для Wiren Board (192.168.100.6). Один Python-файл.</p>
+
+<h2>Что это</h2>
+<p>Заменяет штатный <code>wb-mqtt-serial</code> + <code>rs485-arbiter</code> на корабельной шине.
+Владеет всеми четырьмя LoRa-передатчиками <code>/dev/ttyMOD1..4</code> — это <b>4 равнозначных канала</b>.
+На каждом канале независимо крутится один и тот же автомат корабля: опрос по Modbus
+(pwm8a04 адреса 11/12/13 + ИБП WB-UPS-v3 адрес 10), инжекция кадров плеера DFPlayer прямо в шину,
+автомат режимов, расписание опроса, ограничение тока заряда по температуре, а также настройка
+собственного LoRa-модема канала. Всё зеркалится в MQTT (устройства <code>Ship&nbsp;1..4</code>).</p>
+<p>На одной радио-частоте Modbus-адреса у всех кораблей одинаковые, поэтому одновременно на канале
+общаемся только с одним кораблём; выбор корабля — по LoRa-адресу (перенастройкой передатчика канала).</p>
+
+<h2>Режимы и логика работы</h2>
+<ul class="modes">
+  <li><span class="badge">SEARCH</span> — корабль не на связи. Канал <b>непрерывно зондирует</b> эфир
+      (ток батареи ~раз в 0.8&nbsp;с). Поймал ответ → инициализация (частота 400, моторы 40, подсветка 0)
+      → переход в рабочий режим.</li>
+  <li><span class="badge">SAILING</span> — пришла <b>любая команда управления</b> (моторы/подсветка/частота);
+      сбрасывает таймер 30&nbsp;с. Команды плеера режим НЕ меняют.</li>
+  <li><span class="badge">CHARGING</span> — 30&nbsp;с без команд <b>и ток батареи &gt; 0</b> (идёт заряд).
+      Ток заряда 2000&nbsp;мА; при темп. АКБ &gt; 50&nbsp;°C снижается до 300&nbsp;мА, возврат к 2000 при &lt; 48&nbsp;°C.</li>
+  <li><span class="badge">IDLE</span> — 30&nbsp;с без команд <b>и ток батареи ≤ 0</b> (дрейф на батарее).</li>
+  <li><span class="badge">SERVICE</span> — по переключателю <code>service</code> (опрос всего; для отладки/настройки).</li>
+  <li><span class="badge">OFF</span> — канал выключен (<code>enabled=0</code>): порт закрыт, эфир не трогается.</li>
+  <li><b>Любой режим → SEARCH</b>, если ток батареи перестал читаться (2 промаха × 5&nbsp;с ≈ 10&nbsp;с).</li>
+</ul>
+<p>По умолчанию все 4 канала включены → пустые каналы сидят в SEARCH, пока на них не появится корабль.
+Состояние каналов (вкл/выкл + конфиг модема) сохраняется и переживает перезагрузку.</p>
+
+<h2>Матрица опроса (как часто читаем)</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Параметр</th><th class="c">SEARCH</th><th class="c">SAILING</th><th class="c">IDLE (дрейф)</th><th class="c">CHARGING</th><th class="c">SERVICE</th></tr></thead>
+  <tbody>
+    <tr><td>Ток батареи (пульс)</td><td class="c">непрерывно (~0.8&nbsp;с)</td><td class="c">5&nbsp;с</td><td class="c">5&nbsp;с</td><td class="c">5&nbsp;с</td><td class="c">~1&nbsp;с</td></tr>
+    <tr><td>Температура АКБ</td><td class="c">—</td><td class="c">5&nbsp;мин</td><td class="c">5&nbsp;мин</td><td class="c">10&nbsp;с</td><td class="c">~1&nbsp;с</td></tr>
+    <tr><td>Процент заряда</td><td class="c">—</td><td class="c">5&nbsp;мин</td><td class="c">5&nbsp;мин</td><td class="c">1&nbsp;мин</td><td class="c">~1&nbsp;с</td></tr>
+    <tr><td>Моторы</td><td class="c">—</td><td class="c">1&nbsp;мин</td><td class="c">5&nbsp;мин</td><td class="c">1&nbsp;мин</td><td class="c">~1&nbsp;с</td></tr>
+    <tr><td>Подсветка</td><td class="c">—</td><td class="c">1&nbsp;мин</td><td class="c">5&nbsp;мин</td><td class="c">1&nbsp;мин</td><td class="c">~1&nbsp;с</td></tr>
+    <tr><td>Частота</td><td class="c">—</td><td class="c">5&nbsp;мин</td><td class="c">5&nbsp;мин</td><td class="c">1&nbsp;мин</td><td class="c">~1&nbsp;с</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="sub">В SEARCH опрашивается только ток батареи (для обнаружения корабля); остальное — после появления.
+Команды управления (запись моторов/подсветки/частоты/плеера) идут немедленно, вне расписания.</p>
+
+<h2>Каналы и роли</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Роль</th><th>MQTT-контрол</th><th>Физический канал</th><th>Значение по умолч.</th></tr></thead>
+  <tbody>
+    <tr><td>Мотор зад-лево</td><td><code>back_left</code></td><td>pwm12 · ch1</td><td>40 (холостой)</td></tr>
+    <tr><td>Мотор перёд-лево</td><td><code>front_left</code></td><td>pwm12 · ch2</td><td>40</td></tr>
+    <tr><td>Мотор зад-право</td><td><code>back_right</code></td><td>pwm11 · ch1</td><td>40</td></tr>
+    <tr><td>Мотор перёд-право</td><td><code>front_right</code></td><td>pwm11 · ch2</td><td>40</td></tr>
+    <tr><td>Подсветка 1</td><td><code>light1</code></td><td>pwm11 · ch3</td><td>0</td></tr>
+    <tr><td>Подсветка 2</td><td><code>light2</code></td><td>pwm12 · ch3</td><td>0</td></tr>
+    <tr><td>Подсветка 3</td><td><code>light3</code></td><td>pwm13 · ch2</td><td>0</td></tr>
+    <tr><td>Подсветка 4</td><td><code>light4</code></td><td>pwm13 · ch1</td><td>0</td></tr>
+    <tr><td>Подсветка 5</td><td><code>light5</code></td><td>pwm13 · ch3</td><td>0</td></tr>
+    <tr><td>Частота ШИМ</td><td><code>freq</code></td><td>все каналы pwm</td><td>400 Гц</td></tr>
+    <tr><td>Плеер: трек</td><td><code>mp3_track</code></td><td>DFPlayer</td><td>0=стоп, 1–15=трек</td></tr>
+    <tr><td>Плеер: громкость</td><td><code>mp3_volume</code></td><td>DFPlayer</td><td>0–30</td></tr>
+    <tr><td>Телеметрия ИБП</td><td><code>battery_current / battery_temperature / charge_level</code></td><td>UPS, адрес 10</td><td>чтение</td></tr>
+    <tr><td>Ток заряда</td><td><code>charge_setpoint</code></td><td>UPS, рег. 18</td><td>2000 мА</td></tr>
+    <tr><td>Настройка модема</td><td><code>LoRa_channel / LoRa_air_rate / LoRa_address / LoRa_power + LoRa_read / LoRa_apply</code></td><td>LoRa MODn</td><td>—</td></tr>
+    <tr><td>Канал вкл/выкл</td><td><code>enabled</code></td><td>—</td><td>1</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>MQTT — топики</h2>
+<p>ID устройств: <code>boat1</code>…<code>boat4</code> (в интерфейсе — «Boat 1…4»). Формат:</p>
+<ul>
+  <li><b>Чтение значения:</b> <code>/devices/boat&lt;N&gt;/controls/&lt;контрол&gt;</code></li>
+  <li><b>Команда (запись):</b> тот же топик + суффикс <code>/on</code></li>
+  <li><b>Имя устройства:</b> <code>/devices/boat&lt;N&gt;/meta/name</code></li>
+</ul>
+<div class="scroll">
+<table>
+  <thead><tr><th>Контрол (топик внутри <code>…/controls/</code>)</th><th class="c">Доступ</th><th>Назначение</th></tr></thead>
+  <tbody>
+    <tr><td><code>enabled</code></td><td class="c">Зап.</td><td>канал вкл/выкл (1/0)</td></tr>
+    <tr><td><code>mode</code></td><td class="c">Чт.</td><td>текущий режим (SEARCH/SAILING/CHARGING/IDLE/SERVICE/OFF)</td></tr>
+    <tr><td><code>battery_current</code></td><td class="c">Чт.</td><td>ток батареи, А (&gt;0 = заряд)</td></tr>
+    <tr><td><code>battery_temperature</code></td><td class="c">Чт.</td><td>температура АКБ, °C</td></tr>
+    <tr><td><code>charge_level</code></td><td class="c">Чт.</td><td>заряд, %</td></tr>
+    <tr><td><code>charge_setpoint</code></td><td class="c">Чт.</td><td>заданный ток заряда, мА</td></tr>
+    <tr><td><code>back_left / front_left / back_right / front_right</code></td><td class="c">Зап.</td><td>моторы, 40–80% (40 = холостой)</td></tr>
+    <tr><td><code>light1 … light5</code></td><td class="c">Зап.</td><td>подсветка, 0–100%</td></tr>
+    <tr><td><code>freq</code></td><td class="c">Зап.</td><td>частота ШИМ всех каналов, Гц</td></tr>
+    <tr><td><code>mp3_track</code></td><td class="c">Зап.</td><td>плеер: 0=стоп, 1–15=трек</td></tr>
+    <tr><td><code>mp3_volume</code></td><td class="c">Зап.</td><td>плеер: громкость 0–30</td></tr>
+    <tr><td><code>LoRa_channel</code> / <code>LoRa_air_rate</code> (kbps) / <code>LoRa_power</code> (dBm)</td><td class="c">Зап.</td><td>настройки LoRa-модема (применяются по <code>LoRa_apply</code>)</td></tr>
+    <tr><td><code>LoRa_freq</code></td><td class="c">Чт.</td><td>частота канала, МГц (= 850.125 + channel; обновляется при смене <code>LoRa_channel</code>)</td></tr>
+    <tr><td><code>LoRa_address</code></td><td class="c">Зап.</td><td>LoRa-адрес модема — <b>применяется сразу</b> (переключение корабля)</td></tr>
+    <tr><td><code>LoRa_read / LoRa_apply</code></td><td class="c">Зап.</td><td>кнопки: прочитать / записать конфиг модема</td></tr>
+    <tr><td><code>LoRa_status</code></td><td class="c">Чт.</td><td>результат чтения/записи модема</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Примеры (<code>mosquitto</code>):</p>
+<pre>mosquitto_pub -t /devices/boat1/controls/front_right/on -m 50   # мотор перёд-право = 50%
+mosquitto_pub -t /devices/boat1/controls/light1/on      -m 100  # подсветка 1 = 100%
+mosquitto_pub -t /devices/boat1/controls/mp3_track/on   -m 3    # играть трек 3
+mosquitto_pub -t /devices/boat2/controls/LoRa_address/on -m 23   # LoRa-адрес канала 2 -> 23 (применяется сразу)
+mosquitto_sub -t /devices/boat1/controls/mode                   # текущий режим
+mosquitto_sub -t /devices/boat1/controls/battery_current        # ток батареи</pre>
+
+<h2>Дашборд настройки — «Ship Setup (RS485-1)»</h2>
+<p>Отдельное MQTT-устройство <code>ship_setup</code> для проводной преднастройки корабля по <code>/dev/ttyRS485-1</code>.
+Корабль подключается к RS485-1, его LoRa-модем переводится в <b>config-режим</b> (переключателем на плате).</p>
+<ul>
+  <li><code>service</code> — переключатель: ON ставит все радио-каналы на паузу (mode SERVICE, эфир/провод свободны), OFF — возобновляет.</li>
+  <li><code>LoRa_channel / LoRa_air_rate / LoRa_address / LoRa_power</code> + кнопки <code>LoRa_read / LoRa_apply</code> + <code>LoRa_status</code> —
+      чтение/запись LoRa-модема корабля по проводу (как у каналов, но через RS485-1; модем корабля должен быть в config).</li>
+</ul>
+<p>Порядок: подключить корабль к RS485-1 → модем в config → <code>service</code> ON → задать
+<code>LoRa_address</code> (уникальный) и канал/скорость/мощность под нужный MOD → <code>LoRa_apply</code> →
+вернуть модем в RUN → <code>service</code> OFF. Нужный MOD-канал поймает корабль по LoRa-адресу.</p>
+<div class="note"><b>Важно:</b> «онлайн» определяется по току батареи UPS (адрес 10). Если UPS на корабле
+отключён/обесточен — канал останется в SEARCH, даже если pwm и радио работают.</div>
+
+<h2>Как настраивать LoRa</h2>
+<p>Принцип связи: канал <code>boat1..4</code> = один передатчик MODn на своей частоте. Корабль ловит тот канал,
+у которого совпадают <b>частота (channel)</b> и <b>скорость (air_rate)</b>; <b>адрес</b> различает корабли на одной частоте
+(на одной частоте активен один корабль на канал). Под выбором канала серым показана итоговая частота <code>LoRa_freq</code> (МГц).</p>
+
+<p><b>1) Передатчик канала (MOD1–4) — на устройстве <code>boatN</code>:</b></p>
+<ol>
+  <li>Задать <code>LoRa_channel</code> (под ним обновится <code>LoRa_freq</code>, МГц), <code>LoRa_air_rate</code> (kbps), <code>LoRa_power</code> (dBm).</li>
+  <li>Нажать <code>LoRa_apply</code> — параметры записываются в модем; <code>LoRa_status</code> покажет результат
+      (<code>OK ch=.. freq=.. air=.. addr=.. power=..</code>).</li>
+  <li><code>LoRa_address</code> применяется <b>сразу</b> при изменении — так быстро переключают канал на другой корабль (по его LoRa-адресу).</li>
+  <li><code>LoRa_read</code> — прочитать текущие настройки модема MODn.</li>
+</ol>
+
+<p><b>2) Преднастройка корабля по проводу — дашборд «Ship Setup (RS485-1)»:</b></p>
+<ol>
+  <li>Подключить корабль к разъёму RS485-1; перевести его LoRa-модем в режим <b>CONFIG</b> (переключателем на плате корабля).</li>
+  <li>Включить <code>service</code> на дашборде — все радио-каналы встанут на паузу (эфир и провод свободны).</li>
+  <li>Задать <code>LoRa_channel</code> (видно частоту), <code>LoRa_air_rate</code>, <b>уникальный</b> <code>LoRa_address</code>, <code>LoRa_power</code> → <code>LoRa_apply</code>
+      (<code>LoRa_read</code> — проверить). Запись идёт по проводу, поэтому модем должен быть в CONFIG.</li>
+  <li>Вернуть LoRa-модем корабля в <b>RUN</b> (transparent), выключить <code>service</code>.</li>
+  <li>Канал MODn с такой же частотой/скоростью подхватит корабль. Нужен <b>включённый UPS</b> на корабле —
+      «онлайн» определяется по пульсу тока батареи; без UPS канал останется в SEARCH.</li>
+</ol>
+
+<div class="note"><b>Правило согласования:</b> у корабля и «его» канала MOD должны совпадать <b>channel</b> и <b>air_rate</b>
+(а в transparent-режиме адрес для связи не важен — он нужен, чтобы различать корабли при работе в fixed-режиме).
+RU-каналы: CH14=864.125, CH16=866.125, CH17=867.125, CH19=869.125 МГц.</div>
+
+<h2>Установка / обновление / управление</h2>
+<p><b>Файлы на ВБ:</b> <code>/usr/local/bin/ship-driver.py</code>,
+<code>/etc/systemd/system/ship-driver.service</code>,
+состояние <code>/etc/ship-driver-state.json</code> (создаётся сам).</p>
+<p><b>Установка с нуля:</b></p>
+<pre>scp ship-driver.py       root@192.168.100.6:/usr/local/bin/
+scp ship-driver.service  root@192.168.100.6:/etc/systemd/system/
+ssh root@192.168.100.6 'chmod +x /usr/local/bin/ship-driver.py; systemctl daemon-reload; systemctl enable --now ship-driver'</pre>
+<p><b>Обновление:</b></p>
+<pre>scp ship-driver.py root@192.168.100.6:/usr/local/bin/
+ssh root@192.168.100.6 systemctl restart ship-driver</pre>
+<p><b>Управление:</b></p>
+<pre>systemctl status|restart|stop|start ship-driver
+journalctl -u ship-driver -f          # живой лог
+systemctl disable|enable ship-driver  # автозапуск</pre>
+
+<div class="note">Драйвер при старте сам останавливает <code>wb-mqtt-serial</code>
+(директивы <code>Conflicts</code> / <code>ExecStartPre</code>), чтобы единолично владеть портом, и сам
+переводит модем каждого канала в прозрачный (рабочий) режим при открытии порта — для всех MOD1–4.
+Зависимости (уже стоят): python3, pyserial, paho-mqtt, mosquitto.</div>
+
+<p class="sub">Бэкап: <code>…\Буксир\Драйвер\</code>. Обновлено 2026-06-25.</p>
+</body>
+</html>

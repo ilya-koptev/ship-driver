@@ -1,0 +1,11 @@
+Package: ship-driver
+Version: @VERSION@
+Section: misc
+Priority: optional
+Architecture: all
+Depends: python3, python3-serial, python3-paho-mqtt, mosquitto
+Maintainer: Ilya Koptev <ilya.koptev@struhe.com>
+Description: Ship-bus LoRa driver for Wiren Board
+ Custom driver: owns the 4 MOD LoRa transmitters, talks Modbus to pwm8a04 + WB-UPS-v3,
+ injects DFPlayer frames inline, runs a per-channel mode state machine and adaptive poll
+ schedule, configures the LoRa modems, and mirrors everything to MQTT (boat1..4 + Ship Setup).
