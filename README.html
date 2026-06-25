@@ -198,6 +198,27 @@ systemctl disable|enable ship-driver  # автозапуск</pre>
 переводит модем каждого канала в прозрачный (рабочий) режим при открытии порта — для всех MOD1–4.
 Зависимости (уже стоят): python3, pyserial, paho-mqtt, mosquitto.</div>
 
-<p class="sub">Бэкап: <code>…\Буксир\Драйвер\</code>. Обновлено 2026-06-25.</p>
+<h2>Временно отдать шину штатному <code>wb-mqtt-serial</code> (напр., для настройки УПС)</h2>
+<p>Драйвер и <code>wb-mqtt-serial</code> не могут работать одновременно (директива <code>Conflicts</code>) —
+оба претендуют на один порт. Иногда нужно временно вернуть штатный serial-драйвер (например, чтобы
+настроить ИБП штатными средствами WB). Делается через <code>start</code>/<code>stop</code>,
+<b>без</b> <code>enable/disable</code> — автозапуск не трогаем, и после перезагрузки сам вернётся <code>ship-driver</code>.</p>
+
+<p><b>Отдать шину штатному serial:</b></p>
+<pre>systemctl stop  ship-driver
+systemctl start wb-mqtt-serial</pre>
+
+<p><b>Вернуть наш драйвер:</b></p>
+<pre>systemctl stop  wb-mqtt-serial
+systemctl start ship-driver</pre>
+
+<ul>
+  <li>Ручной <code>systemctl stop ship-driver</code> честно гасит драйвер — <code>Restart=always</code> здесь не мешает (он про падения, а не про ручной стоп).</li>
+  <li>Из-за <code>Conflicts</code> переключение фактически делает и одна команда: <code>systemctl start wb-mqtt-serial</code> сам погасит драйвер, а <code>systemctl start ship-driver</code> — погасит serial. Пары <code>stop+start</code> выше делают это явно.</li>
+  <li>Автозапуск не меняем → после ребута снова поднимется <code>ship-driver</code>. Если настройка затянется через перезагрузку — тогда уже <code>systemctl disable --now ship-driver</code> / <code>enable --now wb-mqtt-serial</code>, и обратно симметрично.</li>
+</ul>
+<p>Проверить, что активно: <code>systemctl is-active ship-driver wb-mqtt-serial</code>.</p>
+
+<p class="sub">Бэкап: <code>…\Буксир\Драйвер\</code>. Обновлено 2026-06-26.</p>
 </body>
 </html>
