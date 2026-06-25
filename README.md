@@ -14,10 +14,8 @@ so the driver installs and updates with `apt`.
 
 ## Install on the controller (one-time)
 
-> Replace `USER` with the GitHub account name that hosts this repo.
-
 ```sh
-echo "deb [trusted=yes] https://USER.github.io/ship-driver ./" | sudo tee /etc/apt/sources.list.d/ship-driver.list
+echo "deb [trusted=yes] https://ilya-koptev.github.io/ship-driver ./" | sudo tee /etc/apt/sources.list.d/ship-driver.list
 sudo apt update
 sudo apt install ship-driver
 ```
