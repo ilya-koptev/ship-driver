@@ -412,7 +412,6 @@ class Driver:
         sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
-        sctl("restart",{"type":"pushbutton","title":"Перезапуск драйвера"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
@@ -441,9 +440,6 @@ class Driver:
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
         elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
         elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
-        elif ctrl=="restart":
-            sp("LoRa_status","перезапуск драйвера..."); print("restart requested via dashboard",flush=True)
-            os.system("systemctl restart ship-driver.service")
     def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
