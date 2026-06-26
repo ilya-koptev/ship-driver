@@ -116,6 +116,7 @@ SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fai
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
 REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
+REG_TAIL=[0x00,0x00]   # regs 0x06,0x07 (CRYPT high/low) — .6 reference; written so the full dump matches
 LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
@@ -230,13 +231,6 @@ class Channel(threading.Thread):
             is_cmd=False; v=max(0,min(MP3_VOL_MAX,iv)); self.send_mp3(mp3_frame(MP3["vol"],v)); self.pub("mp3_volume",v)
         elif ctrl=="ship_number":
             is_cmd=False; self.lora["address"]=iv; self.pub(ctrl,iv); self.lora_op(self.lora)  # ship number = LoRa address; write modem immediately (ship switch)
-        elif ctrl=="lora_write":   # apply this channel's conf "lora" vars (edited in settings) to the modem
-            is_cmd=False
-            try: p=json.load(open(CONF_FILE)).get("lora",{}).get(self.name)
-            except Exception as ex: p=None; print("[%s] lora_write conf err %s"%(self.name,ex),flush=True)
-            if p:
-                self.lora={"channel":int(p["channel"]),"air_rate":float(p["air_rate"]),"address":int(p["address"]),"power":int(p["power"])}
-                self.lora_op(self.lora)
         else: is_cmd=False
         if ctrl in ("enabled","ship_number"): self.drv.save()
         if is_cmd: self.last_cmd=time.monotonic()
@@ -247,40 +241,36 @@ class Channel(threading.Thread):
             try: self.handle(ctrl,val)
             except Exception as e: print("[%s] cmd err %s %s"%(self.name,ctrl,e),flush=True)
 
-    # ---- LoRa modem config of THIS channel's transmitter ----
-    # write=None -> read only (startup); write=dict -> write frame then read back. Both refresh self.lora.
+    # ---- LoRa modem config of THIS channel's transmitter (config-authoritative) ----
+    # target = write (a dict) or self.lora (conf). Reads the modem; if it differs from target+reg5, writes it. Returns responded.
     def lora_op(self,write):
+        target=write if write else self.lora
         was_open=self.ser is not None; ok=False
         try:
             self.open()
             gpio_set(self.gpio,1); time.sleep(0.4)
-            if write:
-                air=AIR_CODE.get(("%g"%write["air_rate"]),7); pw=PWR_CODE.get(str(int(write["power"])),0)
-                msg=bytes([0xC0,0x00,0x06,(int(write["address"])>>8)&0xFF,int(write["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(write["channel"])&0xFF,REG5_TXMODE])
-                self.ser.reset_input_buffer(); self.ser.write(msg); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
             self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r=self.ser.read(64)
             if len(r)>=11 and r[0]==0xC1:
-                ok=True; c=r[3:11]
-                self.lora={"channel":c[4],"air_rate":float(AIR_NAME.get(c[2]&7,"62.5")),
-                           "address":(c[0]<<8)|c[1],"power":int(PWR_NAME.get(c[3]&3,"22"))}
-                self.apply_wiring()   # ship changed -> switch motor/light register map to this address
-                self.pub("ship_number",self.lora["address"])
-                print("[%s] lora %s: ch=%d freq=%.3f air=%s addr=%d power=%s reg5=0x%02x raw=%s"%(self.name,"apply" if write else "read",
-                      c[4],FREQ_BASE+c[4],self.lora["air_rate"],self.lora["address"],self.lora["power"],c[5],c.hex()),flush=True)
-                if write is None:   # startup read: enforce fixed "profile" bytes vs .6 reference, PRESERVING variables (ch/air/addr/power)
-                    sped=SPED_BASE|(c[2]&0x07); option=OPTION_BASE|(c[3]&0x03)
-                    if c[2]!=sped or c[3]!=option or c[5]!=REG5_TXMODE:
-                        print("[%s] profile differs (sped=0x%02x option=0x%02x reg5=0x%02x) -> fixing to reference"%(self.name,c[2],c[3],c[5]),flush=True)
-                        self.ser.reset_input_buffer(); self.ser.write(bytes([0xC0,0x00,0x06,c[0],c[1],sped,option,c[4],REG5_TXMODE])); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
-                        self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r2=self.ser.read(64)
-                        if len(r2)>=11 and r2[0]==0xC1: print("[%s] profile fixed raw=%s"%(self.name,r2[3:11].hex()),flush=True)
-            else: print("[%s] lora %s: no response"%(self.name,"apply" if write else "read"),flush=True)
+                ok=True; b=r[3:11]
+                air=AIR_CODE.get(("%g"%target["air_rate"]),7); pw=PWR_CODE.get(str(int(target["power"])),0)
+                # full register dump (0x00-0x07) per .6 reference: vars (addr/air/chan/power) + fixed (SPED/OPTION hi, reg5=03, crypt=00 00)
+                des=bytes([(int(target["address"])>>8)&0xFF,int(target["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(target["channel"])&0xFF,REG5_TXMODE]+REG_TAIL)
+                print("[%s] modem raw=%s want=%s"%(self.name,b.hex(),des.hex()),flush=True)
+                if bytes(b[0:len(des)])!=des:   # any byte differs -> write the whole dump
+                    print("[%s] writing config to modem (all bytes)"%self.name,flush=True)
+                    self.ser.reset_input_buffer(); self.ser.write(bytes([0xC0,0x00,len(des)])+des); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
+                    self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r2=self.ser.read(64)
+                    if len(r2)>=11 and r2[0]==0xC1: b=r2[3:11]; print("[%s] modem after write raw=%s"%(self.name,b.hex()),flush=True)
+                self.lora={"channel":b[4],"air_rate":float(AIR_NAME.get(b[2]&7,"62.5")),
+                           "address":(b[0]<<8)|b[1],"power":int(PWR_NAME.get(b[3]&3,"22"))}
+                self.apply_wiring(); self.pub("ship_number",self.lora["address"])
+            else: print("[%s] modem: no response"%self.name,flush=True)
         except Exception as e: print("[%s] lora err %s"%(self.name,e),flush=True)
         finally:
             gpio_set(self.gpio,0)
             if not was_open: self.close()
         return ok
-    def probe(self):   # module present? tty exists AND LoRa modem answers a read (a few tries). Read-only (do not disturb flashed config).
+    def probe(self):   # present? tty exists AND modem answers. Config-authoritative: write conf+reg5 to modem if it differs.
         if not os.path.exists(self.tty): return False
         for _ in range(3):
             if self.lora_op(None): self.lora_read=True; return True
@@ -382,14 +372,6 @@ class Driver:
     def load(self):
         try: return json.load(open(STATE_FILE))
         except Exception: return {}
-    def mirror_conf(self):   # write each present modem's actual variables into conf "lora" so the settings reflect live values
-        try: d=json.load(open(CONF_FILE))
-        except Exception: return
-        d.setdefault("lora",{})
-        for n,ch in self.channels.items():
-            d["lora"][n]={"channel":ch.lora["channel"],"air_rate":ch.lora["air_rate"],"address":ch.lora["address"],"power":ch.lora["power"]}
-        try: json.dump(d,open(CONF_FILE,"w"),indent=2,ensure_ascii=False); print("conf 'lora' mirrored from modems",flush=True)
-        except Exception as e: print("conf mirror err",e,flush=True)
     def save(self):
         try: json.dump({n:{"enabled":c.enabled} for n,c in self.channels.items()},open(STATE_FILE,"w"))
         except Exception as e: print("state save err",e,flush=True)
@@ -435,7 +417,6 @@ class Driver:
         sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
-        sctl("lora_write",{"type":"pushbutton","title":"Записать LoRa в модули (из настроек)"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
@@ -464,12 +445,6 @@ class Driver:
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
         elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
         elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
-        elif ctrl=="lora_write":   # apply edited conf "lora" vars to all MOD modems, then restart the driver
-            sp("LoRa_status","запись LoRa в модули + перезапуск...")
-            for ch in self.channels.values(): ch.q.put(("lora_write","1"))
-            print("lora_write: applying conf LoRa to all modems, then restarting",flush=True)
-            time.sleep(6)   # let each channel write its modem (own thread, ~1.5s each)
-            os.system("systemctl restart ship-driver.service")
     def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
@@ -502,7 +477,6 @@ class Driver:
             else: self.absent.append(ch.dev); print("module %s: absent -> no dashboard"%n,flush=True)
         self.channels=present   # dashboards only for modules that actually responded (no fallback)
         if not present: print("no MOD modules responded — only Ship Setup will be shown",flush=True)
-        self.mirror_conf()       # show modems' actual ch/air/addr/power in the settings ("lora" group)
         self.setup_mqtt(); time.sleep(1.0)
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
