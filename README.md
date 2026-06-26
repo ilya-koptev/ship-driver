@@ -1,22 +1,137 @@
 # ship-driver
 
-Custom ship-bus **LoRa driver for Wiren Board**. Owns the 4 MOD LoRa transmitters
-(`/dev/ttyMOD1..4`), talks Modbus to the boat's `pwm8a04` + `WB-UPS-v3`, injects DFPlayer
-frames inline, runs a per-channel mode state machine, and mirrors everything to MQTT
-(devices `boat1..4` = operational API/visualisation + `Ship Setup` for wired modem config).
+Кастомный драйвер корабельной шины для **Wiren Board** (192.168.100.6). Владеет всеми
+четырьмя LoRa‑передатчиками `/dev/ttyMOD1..4` (4 равнозначных канала); на каждом независимо
+крутится один и тот же автомат корабля: опрос по Modbus (`pwm8a04` адреса 11/12/13 + ИБП
+`WB‑UPS‑v3` адрес 10), инжекция кадров плеера DFPlayer прямо в шину, автомат режимов,
+расписание опроса, ограничение тока заряда по температуре. Всё зеркалится в MQTT — устройства
+`boat1..4` (операционный API + визуализация для стороннего софта) и `Ship Setup` (проводная
+преднастройка модема корабля).
 
-Tunables (poll matrix, charge thermal, per-ship motor/light wiring keyed by LoRa address,
-the MOD channel plan, …) live in **`/etc/ship-driver.conf`**, editable from the Wiren Board
-web UI (**Settings → Configuration files → "Ship Driver"**) via a `wb-mqtt-confed` schema.
+Заменяет на корабельной шине штатный `wb-mqtt-serial` + `rs485-arbiter`.
 
-Full driver documentation: **`README.html`**; hardware build + BOM: **`BUILD.html`** (open in a browser).
+Настройки вынесены в **`/etc/ship-driver.conf`** (JSON) и правятся прямо в веб‑интерфейсе WB:
+**Настройки → Конфигурационные файлы → «Ship Driver»** (схема `wb-mqtt-confed`). После
+сохранения сервис перезапускается автоматически.
 
-This repo also ships an **APT repository** (built by GitHub Actions, hosted on GitHub Pages)
-so the driver installs and updates with `apt`.
+Сборка корпуса и спецификация (BOM): **[`BUILD.html`](BUILD.html)**.
 
 ---
 
-## Install on the controller (one-time)
+## Принцип: номер корабля
+
+На одной радио‑частоте Modbus‑адреса у всех кораблей одинаковые (UPS=10, pwm=11/12/13),
+поэтому на канале одновременно общаемся только с одним кораблём. Корабли различаются
+**номером корабля** (= LoRa‑адрес приёмника). Чтобы переключить канал на другой корабль —
+задаём на `boatN` контрол `ship_number`: драйвер сразу пишет этот адрес в модем и переключает
+таблицу регистров (разводку моторов/света) на конфиг нужного корабля.
+
+## Режимы и логика
+
+| Режим | Когда | Что делает |
+|---|---|---|
+| **SEARCH** | корабль не на связи | непрерывно зондирует эфир (ток батареи ~раз в 0.8 с); поймал ответ → инициализация (частота/моторы/свет из конфига) → рабочий режим |
+| **SAILING** | пришла любая команда управления | сбрасывает таймер 30 с (команды плеера режим не меняют) |
+| **CHARGING** | 30 с без команд и ток батареи > 0 | ток заряда 2000 мА; при t АКБ > 50 °C → 600 мА, возврат к 2000 при < 48 °C (гистерезис 2 °C) |
+| **IDLE** | 30 с без команд и ток ≤ 0 | дрейф на батарее |
+| **SERVICE** | переключатель `service` (Ship Setup) | все каналы на паузе (эфир/провод свободны) |
+| **OFF** | `enabled = 0` | порт закрыт, эфир не трогается |
+
+Любой режим → **SEARCH**, если ток батареи перестал читаться (2 промаха ≈ 10 с).
+По умолчанию все 4 канала включены. Вкл/выкл каналов сохраняется в
+`/etc/ship-driver-state.json` и переживает перезагрузку; настройки модемов при старте
+**читаются** из самих модемов (запись — только по смене номера).
+
+«Онлайн» определяется по пульсу тока батареи UPS (адрес 10): если UPS на корабле
+выключен/обесточен — канал останется в SEARCH, даже если pwm и радио работают.
+
+## Матрица опроса (период чтения)
+
+| Параметр | SEARCH | SAILING | IDLE | CHARGING | SERVICE |
+|---|---|---|---|---|---|
+| Ток батареи (пульс) | ~0.8 с | 5 с | 5 с | 5 с | ~1 с |
+| Температура АКБ | — | 5 мин | 5 мин | 10 с | ~1 с |
+| Процент заряда | — | 5 мин | 5 мин | 1 мин | ~1 с |
+| Моторы | — | 1 мин | 5 мин | 1 мин | ~1 с |
+| Подсветка | — | 1 мин | 5 мин | 1 мин | ~1 с |
+
+Команды управления (запись моторов/света/плеера) идут немедленно, вне расписания.
+
+## MQTT — устройства `boat1..4`
+
+Формат: чтение `/devices/boat<N>/controls/<контрол>`, команда — тот же топик + `/on`.
+Набор на борту фиксированный: 4 мотора + 5 огней.
+
+| Контрол | Доступ | Назначение |
+|---|---|---|
+| `enabled` | зап. | канал вкл/выкл (1/0) |
+| `mode` | чт. | текущий режим |
+| `battery_current` / `battery_temperature` / `charge_level` | чт. | телеметрия ИБП (адрес 10) |
+| `back_left` / `front_left` / `back_right` / `front_right` | зап. | моторы, 40–80 % (40 = холостой) |
+| `light1 … light5` | зап. | подсветка, 0–100 % (`light4` = «Ходовые огни», `light5` = «Внутренняя подсветка») |
+| `mp3_track` | зап. | плеер: 0 = стоп, 1–15 = трек |
+| `mp3_volume` | зап. | плеер: громкость 0–30 |
+| `ship_number` | зап. | номер корабля (= LoRa‑адрес) — пишется в модем **сразу**, переключает канал на этот корабль и его разводку |
+
+Частота ШИМ, ток заряда и параметры LoRa (канал/air‑rate/мощность) на дашборде `boatN`
+отсутствуют — они в конфиге.
+
+```sh
+mosquitto_pub -t /devices/boat1/controls/front_right/on -m 50   # мотор перёд-право = 50%
+mosquitto_pub -t /devices/boat1/controls/light1/on      -m 100  # подсветка 1 = 100%
+mosquitto_pub -t /devices/boat1/controls/mp3_track/on   -m 3    # играть трек 3
+mosquitto_pub -t /devices/boat2/controls/ship_number/on -m 23   # канал 2 -> корабль №23 (сразу)
+mosquitto_sub -t /devices/boat1/controls/mode                   # текущий режим
+```
+
+## Конфигурация — `/etc/ship-driver.conf`
+
+Правится в вебе (**Настройки → Конфигурационные файлы → «Ship Driver»**) либо файлом. Две группы:
+
+- **Основное:** скорость шины (список), таймаут ответа, заряд (токи и пороги темп.),
+  значения инициализации, пределы интерфейса (моторы/трек), матрица опроса (+ «таймаут без
+  команд» и «промахи до SEARCH»), LoRa‑план MOD1–4 (канал/air‑rate/адрес/мощность каждого
+  передатчика), «каналы включены при старте».
+- **Корабли:** «По умолчанию» (общие `air_rate` + `power` и резервная разводка) и «Список
+  кораблей» — каждый по своему **номеру (= LoRa‑адрес)**: LoRa‑канал и разводка моторов/света
+  → ШИМ (адрес + канал).
+
+Канал LoRa выбирается из списка с частотами; разрешённые ГКРЧ помечены `✓ ГКРЧ`
+(CH14/16/17/19), остальные — `⚠ вне ГКРЧ`. Захардкожены: база частоты 850.125 МГц, профиль
+E220 (UART 9600, subpkt128, RSSI), макс. громкость, пределы контролов, дефолты дашборда.
+RU/ГКРЧ‑каналы: CH14 = 864.125, CH16 = 866.125, CH17 = 867.125, CH19 = 869.125 МГц.
+
+## Дашборд «Ship Setup (RS485‑1)» — преднастройка корабля по проводу
+
+MQTT‑устройство `ship_setup` для прошивки LoRa‑модема корабля через `/dev/ttyRS485-1`.
+Редактируется только **«Номер корабля»**; остальное — кнопки и индикация:
+
+- `service` — ON ставит все радио‑каналы на паузу (эфир/провод свободны), OFF — возобновляет;
+- `ship_number` — номер корабля (= LoRa‑адрес), единственное редактируемое; `LoRa_address` — его дубль (чтение);
+- **«Считать»** (`LoRa_read`) — читает модем подключённого корабля, показывает `LoRa_channel` / `LoRa_air_rate` / `LoRa_freq` и номер;
+- **«Записать»** (`LoRa_apply`) — берёт параметры этого номера **из конфига** (раздел «Корабли»: канал + общие air‑rate/мощность) и пишет в модем (ошибка, если номера нет в конфиге);
+- `LoRa_status` — результат.
+
+Порядок: подключить корабль к RS485‑1 → его модем в **CONFIG** (переключателем на плате) →
+`service` ON → задать «Номер корабля» → **«Записать»** (или «Считать» для проверки) → вернуть
+модем в **RUN** → `service` OFF. Канал MODn с тем же каналом/скоростью подхватит корабль.
+
+## Временно отдать шину штатному `wb-mqtt-serial` (напр., для настройки УПС)
+
+Драйвер и `wb-mqtt-serial` не работают одновременно (`Conflicts`). Временно — через
+`start`/`stop`, **без** `enable/disable` (после ребута сам вернётся `ship-driver`):
+
+```sh
+systemctl stop  ship-driver  && systemctl start wb-mqtt-serial   # отдать serial
+systemctl stop  wb-mqtt-serial && systemctl start ship-driver    # вернуть драйвер
+```
+
+Из‑за `Conflicts` достаточно и одной команды старта нужного сервиса. Если настройка затянется
+через перезагрузку — тогда `systemctl disable --now ship-driver` / `enable --now wb-mqtt-serial`.
+
+---
+
+## Установка на контроллер (один раз)
 
 ```sh
 echo "deb [trusted=yes] https://ilya-koptev.github.io/ship-driver ./" | sudo tee /etc/apt/sources.list.d/ship-driver.list
@@ -24,28 +139,20 @@ sudo apt update
 sudo apt install ship-driver
 ```
 
-That installs the driver to `/usr/bin/ship-driver.py`, the unit to
-`/lib/systemd/system/ship-driver.service`, the config to `/etc/ship-driver.conf` (a dpkg
-**conffile** — your edits survive upgrades), the web-editor schema to
-`/usr/share/wb-mqtt-confed/schemas/ship-driver.schema.json`, pulls deps (`python3-serial`,
-`python3-paho-mqtt`, `mosquitto`; recommends `wb-mqtt-confed`), and enables + starts the
-service. If a manual install existed (`/usr/local/bin/ship-driver.py` +
-`/etc/systemd/system/ship-driver.service`), the package removes it during install.
+Ставит: драйвер `/usr/bin/ship-driver.py`, юнит `/lib/systemd/system/ship-driver.service`,
+конфиг `/etc/ship-driver.conf` (dpkg **conffile** — правки переживают обновление), схему
+веб‑редактора `/usr/share/wb-mqtt-confed/schemas/ship-driver.schema.json`; тянет зависимости
+(`python3-serial`, `python3-paho-mqtt`, `mosquitto`; рекомендует `wb-mqtt-confed`); включает и
+запускает сервис. Ручную установку (`/usr/local/bin/ship-driver.py` + юнит в
+`/etc/systemd/system/`) пакет при установке удаляет.
 
-## Configure
-
-Edit `/etc/ship-driver.conf` directly, or use the web UI: **Settings → Configuration files →
-"Ship Driver"**. Two groups: **Основное** (bus/charge/poll-matrix/MOD LoRa plan/enabled
-channels) and **Корабли** (per-ship LoRa channel + motor/light wiring, keyed by ship number =
-LoRa address, plus shared defaults). Saving restarts the service automatically.
-
-## Update
+## Обновление
 
 ```sh
 sudo apt update && sudo apt upgrade
 ```
 
-## Manage
+## Управление
 
 ```sh
 systemctl status|restart|stop|start ship-driver
@@ -54,28 +161,27 @@ journalctl -u ship-driver -f
 
 ---
 
-## Releasing a new version (maintainer)
+## Релиз новой версии (мейнтейнеру)
 
-1. Edit the driver (`ship-driver.py`) / unit / docs.
-2. **Bump `VERSION`** (e.g. `1.0.1`) — apt only upgrades to a higher version.
-3. `git commit` + `git push` to `main`.
-4. The GitHub Action **build-and-publish-apt** builds `ship-driver_<VERSION>_all.deb`,
-   regenerates the apt repo, and deploys it to GitHub Pages.
-5. On the controller: `sudo apt update && sudo apt upgrade`.
+1. Правишь драйвер (`ship-driver.py`) / схему (`ship-driver.schema.json`) / конфиг / доки.
+2. **Поднимаешь `VERSION`** (apt обновляет только на бóльшую версию).
+3. `git commit` + `git push` в `main`.
+4. GitHub Action **build-and-publish-apt** собирает `ship-driver_<VERSION>_all.deb`,
+   пересобирает apt‑репозиторий и публикует на GitHub Pages.
+5. На контроллере: `sudo apt update && sudo apt upgrade`.
 
-> ⚠️ To re-publish, **push a new commit** (or run the workflow via *workflow_dispatch*).
-> Do **not** click "Re-run jobs" on an existing run — that produces duplicate `github-pages`
-> artifacts and `deploy-pages` fails with *"Multiple artifacts named github-pages"*.
+> ⚠️ Для перепубликации делай **новый коммит** (или запусти workflow через *workflow_dispatch*).
+> **Не** жми «Re-run jobs» на старом прогоне — появятся дубли артефактов `github-pages`, и
+> `deploy-pages` упадёт с *«Multiple artifacts named github-pages»*.
 
-## Repo setup (one-time, on GitHub)
+## Настройка репозитория (один раз, на GitHub)
 
-- Repository must be **public** (for GitHub Pages + apt over https without auth).
+- Репозиторий **public** (для GitHub Pages + apt по https без авторизации).
 - Settings → **Pages** → Source = **GitHub Actions**.
-- The workflow needs Pages write permission (already declared in the workflow).
 
-The apt repo is currently **unsigned** (`[trusted=yes]`). To add GPG signing later, sign
-`Release` in the workflow and ship the public key.
+apt‑репозиторий сейчас **без подписи** (`[trusted=yes]`). Для GPG‑подписи — подписывать
+`Release` в workflow и поставлять публичный ключ.
 
-## License
+## Лицензия
 
 [MIT](LICENSE) © 2026 Ilya Koptev
