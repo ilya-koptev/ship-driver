@@ -464,9 +464,12 @@ class Driver:
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
         elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
         elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
-        elif ctrl=="lora_write":   # apply edited conf "lora" vars to all MOD modems
-            sp("LoRa_status","запись LoRa в модули...")
+        elif ctrl=="lora_write":   # apply edited conf "lora" vars to all MOD modems, then restart the driver
+            sp("LoRa_status","запись LoRa в модули + перезапуск...")
             for ch in self.channels.values(): ch.q.put(("lora_write","1"))
+            print("lora_write: applying conf LoRa to all modems, then restarting",flush=True)
+            time.sleep(6)   # let each channel write its modem (own thread, ~1.5s each)
+            os.system("systemctl restart ship-driver.service")
     def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
