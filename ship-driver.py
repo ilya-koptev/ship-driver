@@ -11,11 +11,23 @@
 import time, threading, queue, json, os
 import serial
 import paho.mqtt.client as mqtt
-from paho.mqtt.client import CallbackAPIVersion
 
-# ---- hardware topology (WB8-specific, NOT in conf) ----
-CHANNELS={"mod1":("/dev/ttyMOD1",519),"mod2":("/dev/ttyMOD2",522),
-          "mod3":("/dev/ttyMOD3",271),"mod4":("/dev/ttyMOD4",106)}   # name -> (tty, config-gpio)
+# ---- hardware topology: per-board profile {channel name -> (tty, config-gpio)}, auto-selected by board model ----
+HW_PROFILES={
+ "wb8":{"mod1":("/dev/ttyMOD1",519),"mod2":("/dev/ttyMOD2",522),
+        "mod3":("/dev/ttyMOD3",271),"mod4":("/dev/ttyMOD4",106)},
+ # "wb7":{...},  # TODO: fill from a real WB7 — /dev/ttyMOD* + each MOD slot's RTS/config GPIO number
+}
+def detect_board():
+    try: model=open("/proc/device-tree/model","rb").read().decode("ascii","ignore").strip("\x00\n ").lower()
+    except Exception: model=""
+    if "board 7" in model or "wb7" in model: return "wb7"
+    return "wb8"   # default / WB8
+BOARD=detect_board()
+CHANNELS=HW_PROFILES.get(BOARD) or HW_PROFILES["wb8"]
+if BOARD not in HW_PROFILES:
+    print("WARN: no hw profile for board '%s' — using wb8 channel map (config-GPIOs may be wrong)"%BOARD,flush=True)
+print("board=%s channels=%s"%(BOARD,list(CHANNELS)),flush=True)
 RS485="/dev/ttyRS485-1"   # Ship Setup dashboard: wired ship LoRa-modem config (ship modem in config mode by its switch)
 STATE_FILE="/etc/ship-driver-state.json"   # persist per-channel enabled across reboot
 CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
@@ -328,7 +340,12 @@ class Driver:
         try: json.dump({n:{"enabled":c.enabled} for n,c in self.channels.items()},open(STATE_FILE,"w"))
         except Exception as e: print("state save err",e,flush=True)
     def setup_mqtt(self):
-        c=mqtt.Client(CallbackAPIVersion.VERSION1); c.on_connect=self.on_connect; c.on_message=self.on_message
+        try:
+            from paho.mqtt.client import CallbackAPIVersion
+            c=mqtt.Client(CallbackAPIVersion.VERSION1)   # paho-mqtt 2.x (WB8/trixie)
+        except ImportError:
+            c=mqtt.Client()                               # paho-mqtt 1.x (older Debian / WB7)
+        c.on_connect=self.on_connect; c.on_message=self.on_message
         c.connect("localhost",1883,60); self.mqtt=c; c.loop_start()
     def declare(self):
         for n,ch in self.channels.items():
