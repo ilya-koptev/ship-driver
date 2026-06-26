@@ -74,13 +74,13 @@ DEFAULTS={
    "IDLE":    {"current":5,"temp":300,"charge":300,"motors":300,"lights":300},
    "sail_timeout_s":30.0, "offline_fails":2,
    "search_period":0.05, "service_period":1.0},
- "lora":{   # per-MOD channel plan
+ "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
+ },
+ "lora":{   # per-MOD channel plan (top level)
    "mod1":{"channel":14,"air_rate":62.5,"address":3,"power":22},
    "mod2":{"channel":16,"air_rate":62.5,"address":23,"power":22},
    "mod3":{"channel":17,"air_rate":62.5,"address":43,"power":22},
    "mod4":{"channel":19,"air_rate":62.5,"address":63,"power":22}},
- "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
- },
  "ships":{
    "default":{   # shared air_rate/power + fallback wiring for any address not in the list
      "air_rate":62.5,"power":22,
@@ -115,7 +115,7 @@ RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
-LORA_PLAN=M["lora"]   # {mod1..4: {channel,air_rate,address,power}}
+LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
 ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
@@ -168,7 +168,7 @@ class Channel(threading.Thread):
         self.drv=drv; self.name=name; self.tty=tty; self.gpio=gpio
         self.dev="boat"+name[-1]; self.enabled=enabled
         self.ser=None; self.q=queue.Queue()
-        self.mode=OFF; self.online=False; self.fails=0
+        self.mode=None; self.online=False; self.fails=0   # mode=None so the first set_mode always fires (incl. OFF gpio)
         self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={i:0 for i in range(1,NLIGHTS+1)}
@@ -322,6 +322,7 @@ class Channel(threading.Thread):
             self.mode=m; self.pub("mode",m)
             if m==CHARGE:
                 self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL)
+            if m==OFF: gpio_set(self.gpio,1)   # disabled -> put MOD modem into config mode (off-air)
 
     def run(self):
         while True:
