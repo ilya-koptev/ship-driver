@@ -15,10 +15,11 @@ import paho.mqtt.client as mqtt
 # ---- hardware topology: per-board profile {channel -> (tty, config-gpio LINE NAME)}, auto-selected by board model ----
 # The config pin is referenced by its gpiod line NAME ("MODn RTS") and resolved to a sysfs number at start —
 # portable across boards (WB7/WB8 number the line differently but name it the same).
-HW_PROFILES={
- "wb8":{"mod1":("/dev/ttyMOD1","MOD1 RTS"),"mod2":("/dev/ttyMOD2","MOD2 RTS"),
-        "mod3":("/dev/ttyMOD3","MOD3 RTS"),"mod4":("/dev/ttyMOD4","MOD4 RTS")},
- # "wb7":{...},  # TODO: confirm on a real WB7 — /dev/ttyMOD* present and "MODn RTS" line names exist
+_MODMAP={"mod1":("/dev/ttyMOD1","MOD1 RTS"),"mod2":("/dev/ttyMOD2","MOD2 RTS"),
+         "mod3":("/dev/ttyMOD3","MOD3 RTS"),"mod4":("/dev/ttyMOD4","MOD4 RTS")}
+HW_PROFILES={   # WB7 & WB8 name MOD slots identically (/dev/ttyMODn + "MODn RTS"); the by-name gpio resolve
+ "wb8":_MODMAP,  # handles the different numbers (WB8: 519/522/271/106, WB7-A40i: 36/84/52/270)
+ "wb7":_MODMAP,
 }
 GPIO_FALLBACK={"MOD1 RTS":519,"MOD2 RTS":522,"MOD3 RTS":271,"MOD4 RTS":106}   # WB8 numbers if debugfs name map is unavailable
 def gpio_names():   # gpiod line-name -> global sysfs gpio number, parsed from debugfs
@@ -36,8 +37,9 @@ def resolve_gpio(name):
 def detect_board():
     try: model=open("/proc/device-tree/model","rb").read().decode("ascii","ignore").strip("\x00\n ").lower()
     except Exception: model=""
-    if "board 7" in model or "wb7" in model: return "wb7"
-    return "wb8"   # default / WB8
+    if "board 8" in model: return "wb8"
+    if "rev. 7" in model or "rev 7" in model or "a40i" in model or "wb7" in model: return "wb7"   # WB7 (e.g. "Wiren Board rev. 7.4.2 (A40i)")
+    return "wb8"   # default
 BOARD=detect_board()
 _profile=HW_PROFILES.get(BOARD) or HW_PROFILES["wb8"]
 if BOARD not in HW_PROFILES:
