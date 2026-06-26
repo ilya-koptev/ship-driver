@@ -260,6 +260,13 @@ class Channel(threading.Thread):
                 self.pub("ship_number",self.lora["address"])
                 print("[%s] lora %s: ch=%d freq=%.3f air=%s addr=%d power=%s reg5=0x%02x raw=%s"%(self.name,"apply" if write else "read",
                       c[4],FREQ_BASE+c[4],self.lora["air_rate"],self.lora["address"],self.lora["power"],c[5],c.hex()),flush=True)
+                if write is None:   # startup read: enforce fixed "profile" bytes vs .6 reference, PRESERVING variables (ch/air/addr/power)
+                    sped=SPED_BASE|(c[2]&0x07); option=OPTION_BASE|(c[3]&0x03)
+                    if c[2]!=sped or c[3]!=option or c[5]!=REG5_TXMODE:
+                        print("[%s] profile differs (sped=0x%02x option=0x%02x reg5=0x%02x) -> fixing to reference"%(self.name,c[2],c[3],c[5]),flush=True)
+                        self.ser.reset_input_buffer(); self.ser.write(bytes([0xC0,0x00,0x06,c[0],c[1],sped,option,c[4],REG5_TXMODE])); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
+                        self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r2=self.ser.read(64)
+                        if len(r2)>=11 and r2[0]==0xC1: print("[%s] profile fixed raw=%s"%(self.name,r2[3:11].hex()),flush=True)
             else: print("[%s] lora %s: no response"%(self.name,"apply" if write else "read"),flush=True)
         except Exception as e: print("[%s] lora err %s"%(self.name,e),flush=True)
         finally:
@@ -368,6 +375,14 @@ class Driver:
     def load(self):
         try: return json.load(open(STATE_FILE))
         except Exception: return {}
+    def mirror_conf(self):   # write each present modem's actual variables into conf "lora" so the settings reflect live values
+        try: d=json.load(open(CONF_FILE))
+        except Exception: return
+        d.setdefault("lora",{})
+        for n,ch in self.channels.items():
+            d["lora"][n]={"channel":ch.lora["channel"],"air_rate":ch.lora["air_rate"],"address":ch.lora["address"],"power":ch.lora["power"]}
+        try: json.dump(d,open(CONF_FILE,"w"),indent=2,ensure_ascii=False); print("conf 'lora' mirrored from modems",flush=True)
+        except Exception as e: print("conf mirror err",e,flush=True)
     def save(self):
         try: json.dump({n:{"enabled":c.enabled} for n,c in self.channels.items()},open(STATE_FILE,"w"))
         except Exception as e: print("state save err",e,flush=True)
@@ -473,6 +488,7 @@ class Driver:
             else: self.absent.append(ch.dev); print("module %s: absent -> no dashboard"%n,flush=True)
         self.channels=present   # dashboards only for modules that actually responded (no fallback)
         if not present: print("no MOD modules responded — only Ship Setup will be shown",flush=True)
+        self.mirror_conf()       # show modems' actual ch/air/addr/power in the settings ("lora" group)
         self.setup_mqtt(); time.sleep(1.0)
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
