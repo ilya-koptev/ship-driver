@@ -4,9 +4,7 @@
   "title": "Ship Driver (ship-driver)",
   "description": "Настройки драйвера корабля. После сохранения сервис перезапускается.",
   "configFile": {
-    "path": "/etc/ship-driver.conf",
-    "service": "ship-driver",
-    "restartDelayMS": 1500
+    "path": "/etc/ship-driver.conf"
   },
   "strictProps": false,
   "options": {
@@ -316,7 +314,7 @@
     },
     "lora": {
       "type": "object",
-      "title": "LoRa — каналы MOD1-4 (чтение с модулей)",
+      "title": "LoRa — каналы MOD1-4 (правка + кнопка «Записать LoRa»)",
       "propertyOrder": 2,
       "options": {
         "collapsed": true
@@ -331,7 +329,6 @@
             "channel": {
               "type": "integer",
               "title": "Канал",
-              "readonly": true,
               "enum": [
                 0,
                 1,
@@ -506,13 +503,12 @@
                   "CH83 — 933.125 МГц  ⚠ вне ГКРЧ"
                 ]
               },
-              "description": "Читается с модуля. ГКРЧ разрешены только CH14/16/17/19.",
+              "description": "Старт — чтение с модуля. Правьте и жмите «Записать LoRa». ГКРЧ: CH14/16/17/19.",
               "propertyOrder": 1
             },
             "air_rate": {
               "type": "number",
               "title": "Air-rate, kbps",
-              "readonly": true,
               "enum": [
                 2.4,
                 4.8,
@@ -526,7 +522,6 @@
             "address": {
               "type": "integer",
               "title": "Адрес LoRa",
-              "readonly": true,
               "minimum": 0,
               "maximum": 65535,
               "propertyOrder": 3
@@ -534,7 +529,6 @@
             "power": {
               "type": "integer",
               "title": "Мощность, dBm",
-              "readonly": true,
               "enum": [
                 10,
                 13,
@@ -563,7 +557,6 @@
             "channel": {
               "type": "integer",
               "title": "Канал",
-              "readonly": true,
               "enum": [
                 0,
                 1,
@@ -738,13 +731,12 @@
                   "CH83 — 933.125 МГц  ⚠ вне ГКРЧ"
                 ]
               },
-              "description": "Читается с модуля. ГКРЧ разрешены только CH14/16/17/19.",
+              "description": "Старт — чтение с модуля. Правьте и жмите «Записать LoRa». ГКРЧ: CH14/16/17/19.",
               "propertyOrder": 1
             },
             "air_rate": {
               "type": "number",
               "title": "Air-rate, kbps",
-              "readonly": true,
               "enum": [
                 2.4,
                 4.8,
@@ -758,7 +750,6 @@
             "address": {
               "type": "integer",
               "title": "Адрес LoRa",
-              "readonly": true,
               "minimum": 0,
               "maximum": 65535,
               "propertyOrder": 3
@@ -766,7 +757,6 @@
             "power": {
               "type": "integer",
               "title": "Мощность, dBm",
-              "readonly": true,
               "enum": [
                 10,
                 13,
@@ -795,7 +785,6 @@
             "channel": {
               "type": "integer",
               "title": "Канал",
-              "readonly": true,
               "enum": [
                 0,
                 1,
@@ -970,13 +959,12 @@
                   "CH83 — 933.125 МГц  ⚠ вне ГКРЧ"
                 ]
               },
-              "description": "Читается с модуля. ГКРЧ разрешены только CH14/16/17/19.",
+              "description": "Старт — чтение с модуля. Правьте и жмите «Записать LoRa». ГКРЧ: CH14/16/17/19.",
               "propertyOrder": 1
             },
             "air_rate": {
               "type": "number",
               "title": "Air-rate, kbps",
-              "readonly": true,
               "enum": [
                 2.4,
                 4.8,
@@ -990,7 +978,6 @@
             "address": {
               "type": "integer",
               "title": "Адрес LoRa",
-              "readonly": true,
               "minimum": 0,
               "maximum": 65535,
               "propertyOrder": 3
@@ -998,7 +985,6 @@
             "power": {
               "type": "integer",
               "title": "Мощность, dBm",
-              "readonly": true,
               "enum": [
                 10,
                 13,
@@ -1027,7 +1013,6 @@
             "channel": {
               "type": "integer",
               "title": "Канал",
-              "readonly": true,
               "enum": [
                 0,
                 1,
@@ -1202,13 +1187,12 @@
                   "CH83 — 933.125 МГц  ⚠ вне ГКРЧ"
                 ]
               },
-              "description": "Читается с модуля. ГКРЧ разрешены только CH14/16/17/19.",
+              "description": "Старт — чтение с модуля. Правьте и жмите «Записать LoRa». ГКРЧ: CH14/16/17/19.",
               "propertyOrder": 1
             },
             "air_rate": {
               "type": "number",
               "title": "Air-rate, kbps",
-              "readonly": true,
               "enum": [
                 2.4,
                 4.8,
@@ -1222,7 +1206,6 @@
             "address": {
               "type": "integer",
               "title": "Адрес LoRa",
-              "readonly": true,
               "minimum": 0,
               "maximum": 65535,
               "propertyOrder": 3
@@ -1230,7 +1213,6 @@
             "power": {
               "type": "integer",
               "title": "Мощность, dBm",
-              "readonly": true,
               "enum": [
                 10,
                 13,

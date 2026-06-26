@@ -230,6 +230,13 @@ class Channel(threading.Thread):
             is_cmd=False; v=max(0,min(MP3_VOL_MAX,iv)); self.send_mp3(mp3_frame(MP3["vol"],v)); self.pub("mp3_volume",v)
         elif ctrl=="ship_number":
             is_cmd=False; self.lora["address"]=iv; self.pub(ctrl,iv); self.lora_op(self.lora)  # ship number = LoRa address; write modem immediately (ship switch)
+        elif ctrl=="lora_write":   # apply this channel's conf "lora" vars (edited in settings) to the modem
+            is_cmd=False
+            try: p=json.load(open(CONF_FILE)).get("lora",{}).get(self.name)
+            except Exception as ex: p=None; print("[%s] lora_write conf err %s"%(self.name,ex),flush=True)
+            if p:
+                self.lora={"channel":int(p["channel"]),"air_rate":float(p["air_rate"]),"address":int(p["address"]),"power":int(p["power"])}
+                self.lora_op(self.lora)
         else: is_cmd=False
         if ctrl in ("enabled","ship_number"): self.drv.save()
         if is_cmd: self.last_cmd=time.monotonic()
@@ -428,6 +435,7 @@ class Driver:
         sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
+        sctl("lora_write",{"type":"pushbutton","title":"Записать LoRa в модули (из настроек)"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
@@ -456,6 +464,9 @@ class Driver:
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
         elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
         elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
+        elif ctrl=="lora_write":   # apply edited conf "lora" vars to all MOD modems
+            sp("LoRa_status","запись LoRa в модули...")
+            for ch in self.channels.values(): ch.q.put(("lora_write","1"))
     def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
