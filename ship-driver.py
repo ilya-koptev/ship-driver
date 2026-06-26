@@ -135,6 +135,7 @@ NLIGHTS=len(DEFAULT_WIRING[2])
 _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 LIGHT_TITLE={4:"Ходовые огни",5:"Внутренняя подсветка"}   # dashboard titles (others default to "Light N")
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
 def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xFF,param&0xFF,0xEF])
@@ -205,7 +206,8 @@ class Channel(threading.Thread):
         self.ser.reset_input_buffer(); self.ser.write(fr); self.ser.flush(); time.sleep(0.25)
 
     # ---- MQTT helpers ----
-    def pub(self,ctrl,val): self.drv.mqtt.publish("/devices/%s/controls/%s"%(self.dev,ctrl),str(val),retain=True)
+    def pub(self,ctrl,val):
+        if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s"%(self.dev,ctrl),str(val),retain=True)
 
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
@@ -238,7 +240,7 @@ class Channel(threading.Thread):
     # ---- LoRa modem config of THIS channel's transmitter ----
     # write=None -> read only (startup); write=dict -> write frame then read back. Both refresh self.lora.
     def lora_op(self,write):
-        was_open=self.ser is not None
+        was_open=self.ser is not None; ok=False
         try:
             self.open()
             gpio_set(self.gpio,1); time.sleep(0.4)
@@ -248,7 +250,7 @@ class Channel(threading.Thread):
                 self.ser.reset_input_buffer(); self.ser.write(msg); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
             self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r=self.ser.read(64)
             if len(r)>=11 and r[0]==0xC1:
-                c=r[3:11]
+                ok=True; c=r[3:11]
                 self.lora={"channel":c[4],"air_rate":float(AIR_NAME.get(c[2]&7,"62.5")),
                            "address":(c[0]<<8)|c[1],"power":int(PWR_NAME.get(c[3]&3,"22"))}
                 self.apply_wiring()   # ship changed -> switch motor/light register map to this address
@@ -260,6 +262,12 @@ class Channel(threading.Thread):
         finally:
             gpio_set(self.gpio,0)
             if not was_open: self.close()
+        return ok
+    def probe(self):   # module present? tty exists AND LoRa modem answers a read (a few tries). Pre-fills self.lora.
+        if not os.path.exists(self.tty): return False
+        for _ in range(3):
+            if self.lora_op(None): self.lora_read=True; return True
+        return False
 
     # ---- ship logic ----
     def init_ship(self):
@@ -401,7 +409,14 @@ class Driver:
         sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
+        sctl("restart",{"type":"pushbutton","title":"Перезапуск драйвера"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
+        # remove dashboards of absent modules (clear retained topics)
+        for dev in getattr(self,"absent",[]):
+            self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
+            for cname in BOAT_CONTROLS:
+                self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,cname),"",retain=True)
+                self.mqtt.publish("/devices/%s/controls/%s"%(dev,cname),"",retain=True)
     def on_connect(self,c,u,f,rc,props=None): self.declare()
     def on_message(self,c,u,msg):
         p=msg.topic.split("/"); dev=p[2]; ctrl=p[4]; val=msg.payload.decode(errors="ignore").strip()
@@ -423,6 +438,9 @@ class Driver:
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
         elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
         elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
+        elif ctrl=="restart":
+            sp("LoRa_status","перезапуск драйвера..."); print("restart requested via dashboard",flush=True)
+            os.system("systemctl restart ship-driver.service")
     def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
@@ -448,6 +466,13 @@ class Driver:
                 st("ERR нет ответа (модем корабля в режиме CONFIG?)")
         except Exception as e: st("ERR %s"%e)
     def start(self):
+        # detect connected MOD modules — make dashboards only for present ones (before MQTT, pub() is a no-op while mqtt=None)
+        present={}; self.absent=[]
+        for n,ch in self.channels.items():
+            if ch.probe(): present[n]=ch; print("module %s: present"%n,flush=True)
+            else: self.absent.append(ch.dev); print("module %s: absent -> no dashboard"%n,flush=True)
+        if present: self.channels=present
+        else: print("WARN: no modules detected — keeping all channels",flush=True); self.absent=[]
         self.setup_mqtt(); time.sleep(1.0)
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
