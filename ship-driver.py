@@ -265,10 +265,10 @@ class Channel(threading.Thread):
             gpio_set(self.gpio,0)
             if not was_open: self.close()
         return ok
-    def probe(self):   # module present? tty exists AND modem answers; also WRITES the conf LoRa plan to it (config is authoritative)
+    def probe(self):   # module present? tty exists AND LoRa modem answers a read (a few tries). Read-only (do not disturb flashed config).
         if not os.path.exists(self.tty): return False
         for _ in range(3):
-            if self.lora_op(self.lora): self.lora_read=True; return True   # self.lora = conf plan here -> apply + read back
+            if self.lora_op(None): self.lora_read=True; return True
         return False
 
     # ---- ship logic ----
@@ -332,8 +332,8 @@ class Channel(threading.Thread):
             if self.drv.service:                          # global Ship-Setup mode: pause radio (free air/wire)
                 self.set_mode(SERVICE); time.sleep(0.5); continue
             self.open()
-            if not self.lora_read:                         # at start: apply the conf LoRa plan to the modem once
-                self.lora_op(self.lora); self.lora_read=True
+            if not self.lora_read:                         # at start: read modem settings once (read-only, never auto-write)
+                self.lora_op(None); self.lora_read=True
             now=time.monotonic()
             if not self.online:
                 self.set_mode(SEARCH)
