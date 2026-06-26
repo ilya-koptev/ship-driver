@@ -115,6 +115,7 @@ RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
+REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
 LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
@@ -248,7 +249,7 @@ class Channel(threading.Thread):
             gpio_set(self.gpio,1); time.sleep(0.4)
             if write:
                 air=AIR_CODE.get(("%g"%write["air_rate"]),7); pw=PWR_CODE.get(str(int(write["power"])),0)
-                msg=bytes([0xC0,0x00,0x05,(int(write["address"])>>8)&0xFF,int(write["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(write["channel"])&0xFF])
+                msg=bytes([0xC0,0x00,0x06,(int(write["address"])>>8)&0xFF,int(write["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(write["channel"])&0xFF,REG5_TXMODE])
                 self.ser.reset_input_buffer(); self.ser.write(msg); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
             self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r=self.ser.read(64)
             if len(r)>=11 and r[0]==0xC1:
@@ -257,8 +258,8 @@ class Channel(threading.Thread):
                            "address":(c[0]<<8)|c[1],"power":int(PWR_NAME.get(c[3]&3,"22"))}
                 self.apply_wiring()   # ship changed -> switch motor/light register map to this address
                 self.pub("ship_number",self.lora["address"])
-                print("[%s] lora %s: ch=%d freq=%.3f air=%s addr=%d power=%s"%(self.name,"apply" if write else "read",
-                      c[4],FREQ_BASE+c[4],self.lora["air_rate"],self.lora["address"],self.lora["power"]),flush=True)
+                print("[%s] lora %s: ch=%d freq=%.3f air=%s addr=%d power=%s reg5=0x%02x raw=%s"%(self.name,"apply" if write else "read",
+                      c[4],FREQ_BASE+c[4],self.lora["air_rate"],self.lora["address"],self.lora["power"],c[5],c.hex()),flush=True)
             else: print("[%s] lora %s: no response"%(self.name,"apply" if write else "read"),flush=True)
         except Exception as e: print("[%s] lora err %s"%(self.name,e),flush=True)
         finally:
@@ -452,7 +453,7 @@ class Driver:
             ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
             if radio is not None:
                 air=AIR_CODE.get(("%g"%radio["air_rate"]),7); pw=PWR_CODE.get(str(int(radio["power"])),0)
-                msg=bytes([0xC0,0x00,0x05,(int(num)>>8)&0xFF,int(num)&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(radio["channel"])&0xFF])
+                msg=bytes([0xC0,0x00,0x06,(int(num)>>8)&0xFF,int(num)&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(radio["channel"])&0xFF,REG5_TXMODE])
                 ser.reset_input_buffer(); ser.write(msg); ser.flush(); time.sleep(0.5); ser.read(64)
             ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x08])); ser.flush(); time.sleep(0.4); r=ser.read(64)
             ser.close()
@@ -460,7 +461,7 @@ class Driver:
                 c=r[3:11]; addr=(c[0]<<8)|c[1]; air_s=AIR_NAME.get(c[2]&7,"?")
                 sp("ship_number",addr); sp("LoRa_address",addr); sp("LoRa_channel",c[4]); sp("LoRa_air_rate",air_s); sp("LoRa_freq",round(FREQ_BASE+c[4],3))
                 self.setup_number=addr
-                st("OK №%d ch=%d freq=%.3f air=%s power=%s"%(addr,c[4],FREQ_BASE+c[4],air_s,PWR_NAME.get(c[3]&3,"?")))
+                st("OK №%d ch=%d freq=%.3f air=%s power=%s reg5=0x%02x raw=%s"%(addr,c[4],FREQ_BASE+c[4],air_s,PWR_NAME.get(c[3]&3,"?"),c[5],c.hex()))
             else:
                 st("ERR нет ответа (модем корабля в режиме CONFIG?)")
         except Exception as e: st("ERR %s"%e)
