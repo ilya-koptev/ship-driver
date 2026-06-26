@@ -49,7 +49,6 @@ jobs:
           set -e
           mkdir -p repo
           cp ship-driver_*_all.deb repo/
-          cp BUILD.html repo/ || true
           cd repo
           dpkg-scanpackages -m . > Packages
           gzip -9c Packages > Packages.gz
