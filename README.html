@@ -25,17 +25,19 @@
 </head>
 <body>
 <h1>Драйвер корабля — <code>ship-driver</code></h1>
-<p class="sub">Кастомный драйвер корабельной шины для Wiren Board (192.168.100.6). Один Python-файл.</p>
+<p class="sub">Кастомный драйвер корабельной шины для Wiren Board (192.168.100.6). Python-файл + конфиг <code>/etc/ship-driver.conf</code> (редактируется в вебе: Настройки → Конфигурационные файлы → «Ship Driver»).</p>
 
 <h2>Что это</h2>
 <p>Заменяет штатный <code>wb-mqtt-serial</code> + <code>rs485-arbiter</code> на корабельной шине.
 Владеет всеми четырьмя LoRa-передатчиками <code>/dev/ttyMOD1..4</code> — это <b>4 равнозначных канала</b>.
 На каждом канале независимо крутится один и тот же автомат корабля: опрос по Modbus
 (pwm8a04 адреса 11/12/13 + ИБП WB-UPS-v3 адрес 10), инжекция кадров плеера DFPlayer прямо в шину,
-автомат режимов, расписание опроса, ограничение тока заряда по температуре, а также настройка
-собственного LoRa-модема канала. Всё зеркалится в MQTT (устройства <code>Ship&nbsp;1..4</code>).</p>
+автомат режимов, расписание опроса, ограничение тока заряда по температуре. Всё зеркалится в MQTT
+(устройства <code>boat1..4</code> — операционный API + визуализация для стороннего софта).</p>
 <p>На одной радио-частоте Modbus-адреса у всех кораблей одинаковые, поэтому одновременно на канале
-общаемся только с одним кораблём; выбор корабля — по LoRa-адресу (перенастройкой передатчика канала).</p>
+общаемся только с одним кораблём; выбор корабля — по <b>номеру корабля</b> (= LoRa-адрес приёмника).
+Разводка моторов/света и радио-параметры каждого корабля заданы в конфиге по его номеру: при смене
+номера на канале драйвер сразу переписывает модем и переключает таблицу регистров на нужный корабль.</p>
 
 <h2>Режимы и логика работы</h2>
 <ul class="modes">
@@ -53,7 +55,7 @@
   <li><b>Любой режим → SEARCH</b>, если ток батареи перестал читаться (2 промаха × 5&nbsp;с ≈ 10&nbsp;с).</li>
 </ul>
 <p>По умолчанию все 4 канала включены → пустые каналы сидят в SEARCH, пока на них не появится корабль.
-Состояние каналов (вкл/выкл + конфиг модема) сохраняется и переживает перезагрузку.</p>
+Вкл/выкл каналов сохраняется (<code>/etc/ship-driver-state.json</code>) и переживает перезагрузку; настройки модемов при старте читаются из самих модемов.</p>
 
 <h2>Матрица опроса (как часто читаем)</h2>
 <div class="scroll">
@@ -86,16 +88,15 @@
     <tr><td>Подсветка 3</td><td><code>light3</code></td><td>pwm13 · ch2</td><td>0</td></tr>
     <tr><td>Подсветка 4</td><td><code>light4</code></td><td>pwm13 · ch1</td><td>0</td></tr>
     <tr><td>Подсветка 5</td><td><code>light5</code></td><td>pwm13 · ch3</td><td>0</td></tr>
-    <tr><td>Частота ШИМ</td><td><code>freq</code></td><td>все каналы pwm</td><td>400 Гц</td></tr>
     <tr><td>Плеер: трек</td><td><code>mp3_track</code></td><td>DFPlayer</td><td>0=стоп, 1–15=трек</td></tr>
     <tr><td>Плеер: громкость</td><td><code>mp3_volume</code></td><td>DFPlayer</td><td>0–30</td></tr>
     <tr><td>Телеметрия ИБП</td><td><code>battery_current / battery_temperature / charge_level</code></td><td>UPS, адрес 10</td><td>чтение</td></tr>
-    <tr><td>Ток заряда</td><td><code>charge_setpoint</code></td><td>UPS, рег. 18</td><td>2000 мА</td></tr>
-    <tr><td>Настройка модема</td><td><code>LoRa_channel / LoRa_air_rate / LoRa_address / LoRa_power + LoRa_read / LoRa_apply</code></td><td>LoRa MODn</td><td>—</td></tr>
+    <tr><td>Номер корабля</td><td><code>ship_number</code></td><td>= LoRa-адрес модема MODn</td><td>пишется сразу, переключает корабль</td></tr>
     <tr><td>Канал вкл/выкл</td><td><code>enabled</code></td><td>—</td><td>1</td></tr>
   </tbody>
 </table>
 </div>
+<p class="sub">Адреса/каналы pwm в колонке «Физический канал» — это разводка <b>по умолчанию</b>; фактическая берётся из конфига по номеру корабля (раздел «Корабли»). Частота ШИМ и ток заряда задаются в конфиге, на дашборде их нет.</p>
 
 <h2>MQTT — топики</h2>
 <p>ID устройств: <code>boat1</code>…<code>boat4</code> (в интерфейсе — «Boat 1…4»). Формат:</p>
@@ -113,82 +114,71 @@
     <tr><td><code>battery_current</code></td><td class="c">Чт.</td><td>ток батареи, А (&gt;0 = заряд)</td></tr>
     <tr><td><code>battery_temperature</code></td><td class="c">Чт.</td><td>температура АКБ, °C</td></tr>
     <tr><td><code>charge_level</code></td><td class="c">Чт.</td><td>заряд, %</td></tr>
-    <tr><td><code>charge_setpoint</code></td><td class="c">Чт.</td><td>заданный ток заряда, мА</td></tr>
     <tr><td><code>back_left / front_left / back_right / front_right</code></td><td class="c">Зап.</td><td>моторы, 40–80% (40 = холостой)</td></tr>
-    <tr><td><code>light1 … light5</code></td><td class="c">Зап.</td><td>подсветка, 0–100%</td></tr>
-    <tr><td><code>freq</code></td><td class="c">Зап.</td><td>частота ШИМ всех каналов, Гц</td></tr>
+    <tr><td><code>light1 … light5</code></td><td class="c">Зап.</td><td>подсветка, 0–100% (light4=«Ходовые огни», light5=«Внутренняя подсветка»)</td></tr>
     <tr><td><code>mp3_track</code></td><td class="c">Зап.</td><td>плеер: 0=стоп, 1–15=трек</td></tr>
     <tr><td><code>mp3_volume</code></td><td class="c">Зап.</td><td>плеер: громкость 0–30</td></tr>
-    <tr><td><code>LoRa_channel</code> / <code>LoRa_air_rate</code> (kbps) / <code>LoRa_power</code> (dBm)</td><td class="c">Зап.</td><td>настройки LoRa-модема (применяются по <code>LoRa_apply</code>)</td></tr>
-    <tr><td><code>LoRa_freq</code></td><td class="c">Чт.</td><td>частота канала, МГц (= 850.125 + channel; обновляется при смене <code>LoRa_channel</code>)</td></tr>
-    <tr><td><code>LoRa_address</code></td><td class="c">Зап.</td><td>LoRa-адрес модема — <b>применяется сразу</b> (переключение корабля)</td></tr>
-    <tr><td><code>LoRa_read / LoRa_apply</code></td><td class="c">Зап.</td><td>кнопки: прочитать / записать конфиг модема</td></tr>
-    <tr><td><code>LoRa_status</code></td><td class="c">Чт.</td><td>результат чтения/записи модема</td></tr>
+    <tr><td><code>ship_number</code></td><td class="c">Зап.</td><td>номер корабля (= LoRa-адрес) — <b>пишется в модем сразу</b>, переключает канал на этот корабль и его разводку</td></tr>
   </tbody>
 </table>
 </div>
+<p class="sub">Частота ШИМ, ток заряда и параметры LoRa (канал/air-rate/мощность) на дашборде <code>boatN</code> отсутствуют — они в конфиге. На борту фиксированный набор: 4 мотора + 5 огней.</p>
 <p>Примеры (<code>mosquitto</code>):</p>
 <pre>mosquitto_pub -t /devices/boat1/controls/front_right/on -m 50   # мотор перёд-право = 50%
 mosquitto_pub -t /devices/boat1/controls/light1/on      -m 100  # подсветка 1 = 100%
 mosquitto_pub -t /devices/boat1/controls/mp3_track/on   -m 3    # играть трек 3
-mosquitto_pub -t /devices/boat2/controls/LoRa_address/on -m 23   # LoRa-адрес канала 2 -> 23 (применяется сразу)
+mosquitto_pub -t /devices/boat2/controls/ship_number/on -m 23   # канал 2 -> корабль №23 (пишется сразу)
 mosquitto_sub -t /devices/boat1/controls/mode                   # текущий режим
 mosquitto_sub -t /devices/boat1/controls/battery_current        # ток батареи</pre>
 
-<h2>Дашборд настройки — «Ship Setup (RS485-1)»</h2>
-<p>Отдельное MQTT-устройство <code>ship_setup</code> для проводной преднастройки корабля по <code>/dev/ttyRS485-1</code>.
-Корабль подключается к RS485-1, его LoRa-модем переводится в <b>config-режим</b> (переключателем на плате).</p>
+<h2>Конфигурация — <code>/etc/ship-driver.conf</code></h2>
+<p>Все «крутилки» вынесены в JSON-конфиг, который правится прямо в вебе: <b>Настройки → Конфигурационные файлы → «Ship Driver»</b>
+(схема <code>wb-mqtt-confed</code>). После сохранения сервис перезапускается автоматически. Две группы:</p>
 <ul>
-  <li><code>service</code> — переключатель: ON ставит все радио-каналы на паузу (mode SERVICE, эфир/провод свободны), OFF — возобновляет.</li>
-  <li><code>LoRa_channel / LoRa_air_rate / LoRa_address / LoRa_power</code> + кнопки <code>LoRa_read / LoRa_apply</code> + <code>LoRa_status</code> —
-      чтение/запись LoRa-модема корабля по проводу (как у каналов, но через RS485-1; модем корабля должен быть в config).</li>
+  <li><b>Основное:</b> скорость шины (список), таймаут ответа, заряд (токи и пороги темп.), значения инициализации,
+      пределы интерфейса (моторы/трек), матрица опроса (+ «таймаут без команд» и «промахи до SEARCH»),
+      LoRa-план MOD1–4 (канал/air-rate/адрес/мощность каждого передатчика), «каналы включены при старте».</li>
+  <li><b>Корабли:</b> «По умолчанию» (общие <code>air_rate</code>+<code>power</code> и резервная разводка) и «Список кораблей» —
+      каждый корабль по своему <b>номеру (=LoRa-адрес)</b>: LoRa-канал и разводка моторов/света → ШИМ (адрес+канал).</li>
 </ul>
-<p>Порядок: подключить корабль к RS485-1 → модем в config → <code>service</code> ON → задать
-<code>LoRa_address</code> (уникальный) и канал/скорость/мощность под нужный MOD → <code>LoRa_apply</code> →
-вернуть модем в RUN → <code>service</code> OFF. Нужный MOD-канал поймает корабль по LoRa-адресу.</p>
+<p>Канал LoRa выбирается из списка с частотами; разрешённые ГКРЧ помечены <code>✓ ГКРЧ</code> (CH14/16/17/19),
+остальные — <code>⚠ вне ГКРЧ</code>. Несколько параметров захардкожены (база частоты 850.125 МГц, профиль E220,
+макс. громкость, пределы контролов, дефолты дашборда).</p>
+
+<h2>Дашборд «Ship Setup (RS485-1)» — преднастройка корабля по проводу</h2>
+<p>MQTT-устройство <code>ship_setup</code> для прошивки LoRa-модема корабля через <code>/dev/ttyRS485-1</code>.
+Редактируется только <b>«Номер корабля»</b>; остальное — кнопки и индикация:</p>
+<ul>
+  <li><code>service</code> — ON ставит все радио-каналы на паузу (эфир/провод свободны), OFF — возобновляет.</li>
+  <li><code>ship_number</code> — номер корабля (= LoRa-адрес), единственное редактируемое поле; <code>LoRa_address</code> — его дубль (чтение).</li>
+  <li><b>«Считать»</b> (<code>LoRa_read</code>) — читает модем подключённого корабля и показывает <code>LoRa_channel / LoRa_air_rate / LoRa_freq</code> и его номер.</li>
+  <li><b>«Записать»</b> (<code>LoRa_apply</code>) — берёт параметры корабля с этим номером <b>из конфига</b> (раздел «Корабли»: канал + общие air-rate/мощность) и пишет их в модем. Если номера нет в конфиге → <code>ERR корабль №N не настроен</code>.</li>
+  <li><code>LoRa_status</code> — результат операции.</li>
+</ul>
+<p>Порядок: подключить корабль к RS485-1 → его модем в <b>CONFIG</b> (переключателем на плате) → <code>service</code> ON →
+задать «Номер корабля» → <b>«Записать»</b> (или «Считать» для проверки) → вернуть модем в <b>RUN</b> → <code>service</code> OFF.
+Канал MODn с тем же каналом/скоростью подхватит корабль по его номеру.</p>
+
+<h2>Как переключать корабль на канале</h2>
+<p>Канал <code>boatN</code> = передатчик MODn на своей частоте (из LoRa-плана). Чтобы переключить канал на другой корабль —
+задать на <code>boatN</code> контрол <b>«Номер корабля»</b> (<code>ship_number</code>): драйвер сразу пишет этот адрес в модем
+и переключает разводку моторов/света на конфиг этого корабля. Корабль и «его» канал MOD должны совпадать по <b>каналу</b> и <b>air-rate</b>.</p>
 <div class="note"><b>Важно:</b> «онлайн» определяется по току батареи UPS (адрес 10). Если UPS на корабле
-отключён/обесточен — канал останется в SEARCH, даже если pwm и радио работают.</div>
-
-<h2>Как настраивать LoRa</h2>
-<p>Принцип связи: канал <code>boat1..4</code> = один передатчик MODn на своей частоте. Корабль ловит тот канал,
-у которого совпадают <b>частота (channel)</b> и <b>скорость (air_rate)</b>; <b>адрес</b> различает корабли на одной частоте
-(на одной частоте активен один корабль на канал). Под выбором канала серым показана итоговая частота <code>LoRa_freq</code> (МГц).</p>
-
-<p><b>1) Передатчик канала (MOD1–4) — на устройстве <code>boatN</code>:</b></p>
-<ol>
-  <li>Задать <code>LoRa_channel</code> (под ним обновится <code>LoRa_freq</code>, МГц), <code>LoRa_air_rate</code> (kbps), <code>LoRa_power</code> (dBm).</li>
-  <li>Нажать <code>LoRa_apply</code> — параметры записываются в модем; <code>LoRa_status</code> покажет результат
-      (<code>OK ch=.. freq=.. air=.. addr=.. power=..</code>).</li>
-  <li><code>LoRa_address</code> применяется <b>сразу</b> при изменении — так быстро переключают канал на другой корабль (по его LoRa-адресу).</li>
-  <li><code>LoRa_read</code> — прочитать текущие настройки модема MODn.</li>
-</ol>
-
-<p><b>2) Преднастройка корабля по проводу — дашборд «Ship Setup (RS485-1)»:</b></p>
-<ol>
-  <li>Подключить корабль к разъёму RS485-1; перевести его LoRa-модем в режим <b>CONFIG</b> (переключателем на плате корабля).</li>
-  <li>Включить <code>service</code> на дашборде — все радио-каналы встанут на паузу (эфир и провод свободны).</li>
-  <li>Задать <code>LoRa_channel</code> (видно частоту), <code>LoRa_air_rate</code>, <b>уникальный</b> <code>LoRa_address</code>, <code>LoRa_power</code> → <code>LoRa_apply</code>
-      (<code>LoRa_read</code> — проверить). Запись идёт по проводу, поэтому модем должен быть в CONFIG.</li>
-  <li>Вернуть LoRa-модем корабля в <b>RUN</b> (transparent), выключить <code>service</code>.</li>
-  <li>Канал MODn с такой же частотой/скоростью подхватит корабль. Нужен <b>включённый UPS</b> на корабле —
-      «онлайн» определяется по пульсу тока батареи; без UPS канал останется в SEARCH.</li>
-</ol>
-
-<div class="note"><b>Правило согласования:</b> у корабля и «его» канала MOD должны совпадать <b>channel</b> и <b>air_rate</b>
-(а в transparent-режиме адрес для связи не важен — он нужен, чтобы различать корабли при работе в fixed-режиме).
-RU-каналы: CH14=864.125, CH16=866.125, CH17=867.125, CH19=869.125 МГц.</div>
+отключён/обесточен — канал останется в SEARCH, даже если pwm и радио работают.<br>
+RU/ГКРЧ-каналы: CH14=864.125, CH16=866.125, CH17=867.125, CH19=869.125 МГц.</div>
 
 <h2>Установка / обновление / управление</h2>
-<p><b>Файлы на ВБ:</b> <code>/usr/local/bin/ship-driver.py</code>,
-<code>/etc/systemd/system/ship-driver.service</code>,
-состояние <code>/etc/ship-driver-state.json</code> (создаётся сам).</p>
-<p><b>Установка с нуля:</b></p>
-<pre>scp ship-driver.py       root@192.168.100.6:/usr/local/bin/
-scp ship-driver.service  root@192.168.100.6:/etc/systemd/system/
-ssh root@192.168.100.6 'chmod +x /usr/local/bin/ship-driver.py; systemctl daemon-reload; systemctl enable --now ship-driver'</pre>
+<p><b>Файлы на ВБ (ставит пакет):</b> <code>/usr/bin/ship-driver.py</code>,
+<code>/lib/systemd/system/ship-driver.service</code>,
+конфиг <code>/etc/ship-driver.conf</code> (conffile — правки переживают обновление),
+схема веб-редактора <code>/usr/share/wb-mqtt-confed/schemas/ship-driver.schema.json</code>,
+состояние каналов <code>/etc/ship-driver-state.json</code> (создаётся сам).</p>
+<p><b>Установка (apt-репозиторий на GitHub Pages):</b></p>
+<pre>echo "deb [trusted=yes] https://ilya-koptev.github.io/ship-driver ./" | sudo tee /etc/apt/sources.list.d/ship-driver.list
+sudo apt update
+sudo apt install ship-driver</pre>
 <p><b>Обновление:</b></p>
-<pre>scp ship-driver.py root@192.168.100.6:/usr/local/bin/
-ssh root@192.168.100.6 systemctl restart ship-driver</pre>
+<pre>sudo apt update &amp;&amp; sudo apt upgrade</pre>
 <p><b>Управление:</b></p>
 <pre>systemctl status|restart|stop|start ship-driver
 journalctl -u ship-driver -f          # живой лог
@@ -197,7 +187,8 @@ systemctl disable|enable ship-driver  # автозапуск</pre>
 <div class="note">Драйвер при старте сам останавливает <code>wb-mqtt-serial</code>
 (директивы <code>Conflicts</code> / <code>ExecStartPre</code>), чтобы единолично владеть портом, и сам
 переводит модем каждого канала в прозрачный (рабочий) режим при открытии порта — для всех MOD1–4.
-Зависимости (уже стоят): python3, pyserial, paho-mqtt, mosquitto.</div>
+При старте параметры модемов <b>читаются</b> (не пишутся). Зависимости: python3, pyserial, paho-mqtt, mosquitto;
+для веб-редактора конфига — wb-mqtt-confed.</div>
 
 <h2>Временно отдать шину штатному <code>wb-mqtt-serial</code> (напр., для настройки УПС)</h2>
 <p>Драйвер и <code>wb-mqtt-serial</code> не могут работать одновременно (директива <code>Conflicts</code>) —

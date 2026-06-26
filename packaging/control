@@ -4,6 +4,7 @@ Section: misc
 Priority: optional
 Architecture: all
 Depends: python3, python3-serial, python3-paho-mqtt, mosquitto
+Recommends: wb-mqtt-confed
 Maintainer: Ilya Koptev <ilya.koptev@struhe.com>
 Description: Ship-bus LoRa driver for Wiren Board
  Custom driver: owns the 4 MOD LoRa transmitters, talks Modbus to pwm8a04 + WB-UPS-v3,

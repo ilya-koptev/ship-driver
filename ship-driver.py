@@ -2,42 +2,107 @@
 # ship-driver.py — custom multi-channel ship-bus driver.
 # 4 equivalent LoRa transmitters (MOD1-4 = /dev/ttyMOD1..4). Each channel independently owns its
 # port and runs the SAME ship logic against one active ship (Modbus addrs identical on every ship:
-# UPS=10, pwm=11/12/13; ships are told apart by LoRa address -> reconfigure the channel's modem to
+# UPS=10, pwm=11/12/13; ships are told apart by LoRa address -> change the channel modem address to
 # switch ship). Per channel: Modbus RTU + inline DFPlayer + mode state machine + poll schedule +
-# simple charge-thermal + the channel's own LoRa modem config. Mirrors to MQTT (WB convention).
+# simple charge-thermal. Tunables live in /etc/ship-driver.conf (defaults below if absent).
+# boatN MQTT device = operational API + visualisation (driven by external software); LoRa config
+# lives in the conf, only LoRa_address is live on boatN (writes the modem immediately, applying the
+# conf channel/air/power + the new address). Wired ship pre-config stays on the "Ship Setup" dashboard.
 import time, threading, queue, json, os
 import serial
 import paho.mqtt.client as mqtt
 from paho.mqtt.client import CallbackAPIVersion
 
-BAUD=9600; RESP_TO=0.8
-# channels: name -> (tty, config-gpio). MOD1-4 are equivalent.
+# ---- hardware topology (WB8-specific, NOT in conf) ----
 CHANNELS={"mod1":("/dev/ttyMOD1",519),"mod2":("/dev/ttyMOD2",522),
-          "mod3":("/dev/ttyMOD3",271),"mod4":("/dev/ttyMOD4",106)}
-ENABLED_AT_START={"mod1","mod2","mod3","mod4"}   # default (no saved state): all channels active -> SEARCH until a ship appears
-LORA_PLAN={"mod1":(14,3),"mod2":(16,23),"mod3":(17,43),"mod4":(19,63)}  # (channel, address) defaults
-STATE_FILE="/etc/ship-driver-state.json"   # persist per-channel enabled + modem config across reboot
+          "mod3":("/dev/ttyMOD3",271),"mod4":("/dev/ttyMOD4",106)}   # name -> (tty, config-gpio)
 RS485="/dev/ttyRS485-1"   # Ship Setup dashboard: wired ship LoRa-modem config (ship modem in config mode by its switch)
+STATE_FILE="/etc/ship-driver-state.json"   # persist per-channel enabled across reboot
+CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
 
 PWM_SLAVES=[11,12,13]; FREQ_REG={1:0,2:1,3:2}; DUTY_REG={1:112,2:113,3:114}
-MOTORS=[("back_left",12,1),("front_left",12,2),("back_right",11,1),("front_right",11,2)]  # after pwm addr rotation 11->13,12->11,13->12 (same physical outputs)
-MOTOR_MAP={n:(s,c) for n,s,c in MOTORS}
-MOTOR_TITLE={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
-LIGHTS=[(11,3),(12,3),(13,2),(13,1),(13,3)]  # light1..5 renamed 2026-06-25 (1->5,2->1,3->4,4->3,5->2)
 ALL_CH=[(s,c) for s in PWM_SLAVES for c in (1,2,3)]
-INIT_FREQ=400; INIT_MOTOR=40; INIT_LIGHT=0
-MOTOR_MIN=40; MOTOR_MAX=80   # motor slider range (40=idle, 80=max)
 UPS=10; UPS_CUR=5; UPS_CHG=8; UPS_TEMP=9; UPS_CHG_SETPOINT=18
-CHG_FULL=2000; CHG_LOW=600; T_LIMIT=50.0; T_RESTORE=48.0
-SAIL_TIMEOUT=30.0; OFFLINE_FAILS=2
+# motor/light -> (pwm slave, channel) wiring is loaded from the conf "wiring" section below
 
 SEARCH="SEARCH"; SAIL="SAILING"; CHARGE="CHARGING"; IDLE="IDLE"; SERVICE="SERVICE"; OFF="OFF"
-RATES={
- CHARGE: {"current":5,"temp":10,"charge":60,"motors":60,"lights":60,"freq":60},
- SAIL:   {"current":5,"temp":300,"charge":300,"motors":60,"lights":60,"freq":300},
- IDLE:   {"current":5,"temp":300,"charge":300,"motors":300,"lights":300,"freq":300},
+
+# ---- tunable defaults (overridden per-key by /etc/ship-driver.conf) ----
+DEFAULTS={
+ "main":{
+ "baud":9600, "resp_timeout_s":0.8,
+ "charge":{"full_ma":2000,"low_ma":600,"t_limit_c":50.0,"t_restore_c":48.0},
+ "init":{"freq":400,"motor":40,"light":0},
+ "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
+ "rates":{
+   "CHARGING":{"current":5,"temp":10,"charge":60,"motors":60,"lights":60},
+   "SAILING": {"current":5,"temp":300,"charge":300,"motors":60,"lights":60},
+   "IDLE":    {"current":5,"temp":300,"charge":300,"motors":300,"lights":300},
+   "sail_timeout_s":30.0, "offline_fails":2,
+   "search_period":0.05, "service_period":1.0},
+ "lora":{   # per-MOD channel plan
+   "mod1":{"channel":14,"air_rate":62.5,"address":3,"power":22},
+   "mod2":{"channel":16,"air_rate":62.5,"address":23,"power":22},
+   "mod3":{"channel":17,"air_rate":62.5,"address":43,"power":22},
+   "mod4":{"channel":19,"air_rate":62.5,"address":63,"power":22}},
+ "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
+ },
+ "ships":{
+   "default":{   # shared air_rate/power + fallback wiring for any address not in the list
+     "air_rate":62.5,"power":22,
+     "motors":{"back_left":{"slave":12,"channel":1},"front_left":{"slave":12,"channel":2},
+               "back_right":{"slave":11,"channel":1},"front_right":{"slave":11,"channel":2}},
+     "lights":{"light1":{"slave":11,"channel":3},"light2":{"slave":12,"channel":3},"light3":{"slave":13,"channel":2},
+               "light4":{"slave":13,"channel":1},"light5":{"slave":13,"channel":3}}},
+   "list":[],   # per ship: {"address":N,"channel":C,"motors":{...},"lights":{...}}
+ },
 }
-SEARCH_PERIOD=0.05; SERVICE_PERIOD=1.0   # search paced by the read timeout itself (~0.8s/probe), no extra sleep
+def deep_merge(base,over):
+    for k,v in (over or {}).items():
+        if isinstance(v,dict) and isinstance(base.get(k),dict): deep_merge(base[k],v)
+        else: base[k]=v
+    return base
+def load_conf():
+    base=json.loads(json.dumps(DEFAULTS))
+    try: deep_merge(base,json.load(open(CONF_FILE)))
+    except FileNotFoundError: pass
+    except Exception as e: print("conf load err (using defaults):",e,flush=True)
+    return base
+C=load_conf()
+
+M=C["main"]
+BAUD=M["baud"]; RESP_TO=M["resp_timeout_s"]
+CHG_FULL=M["charge"]["full_ma"]; CHG_LOW=M["charge"]["low_ma"]
+T_LIMIT=M["charge"]["t_limit_c"]; T_RESTORE=M["charge"]["t_restore_c"]
+INIT_FREQ=M["init"]["freq"]; INIT_MOTOR=M["init"]["motor"]; INIT_LIGHT=M["init"]["light"]
+MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]
+MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardcoded
+RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
+SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
+SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
+FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
+LORA_PLAN=M["lora"]   # {mod1..4: {channel,air_rate,address,power}}
+SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
+ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
+ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
+def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[(slave,ch)] in light1..N order)
+    motors=[(n,m["slave"],m["channel"]) for n,m in w["motors"].items()]
+    lights=[(w["lights"][k]["slave"],w["lights"][k]["channel"]) for k in sorted(w["lights"],key=lambda x:int(x[5:]))]
+    return motors,{n:(s,c) for n,s,c in motors},lights
+SD=C["ships"]; SHIP_DEFAULT=SD["default"]; SHIP_LIST=SD.get("list",[])
+DEFAULT_WIRING=parse_wiring(SHIP_DEFAULT)                       # fallback wiring (address not in list)
+DEFAULT_AIR_RATE=SHIP_DEFAULT["air_rate"]; DEFAULT_POWER=SHIP_DEFAULT["power"]   # shared for all ships
+SHIP_WIRING={int(s["address"]):parse_wiring(s) for s in SHIP_LIST}              # LoRa address -> wiring
+SHIP_RADIO={int(s["address"]):{"channel":s["channel"],"air_rate":DEFAULT_AIR_RATE,"power":DEFAULT_POWER} for s in SHIP_LIST}  # number -> radio for Ship Setup write
+def wiring_for(addr):
+    try: return SHIP_WIRING.get(int(addr),DEFAULT_WIRING)
+    except Exception: return DEFAULT_WIRING
+# control set is the SAME on every ship -> names/count fixed (from default), only the register mapping varies per ship
+MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
+NLIGHTS=len(DEFAULT_WIRING[2])
+_MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
+MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
+LIGHT_TITLE={4:"Ходовые огни",5:"Внутренняя подсветка"}   # dashboard titles (others default to "Light N")
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
 def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xFF,param&0xFF,0xEF])
@@ -69,17 +134,20 @@ class Channel(threading.Thread):
         self.dev="boat"+name[-1]; self.enabled=enabled
         self.ser=None; self.q=queue.Queue()
         self.mode=OFF; self.online=False; self.fails=0
-        self.last_cmd=0.0
+        self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}
-        self.motor={n:0 for n,_,_ in MOTORS}; self.light={k:0 for k in LIGHTS}
+        self.motor={n:0 for n in MOTOR_NAMES}; self.light={i:0 for i in range(1,NLIGHTS+1)}
         self.due={}
-        ch,addr=LORA_PLAN[name]; self.lora={"channel":ch,"air_rate":62.5,"address":addr,"power":22}
+        self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
+        self.apply_wiring()               # pick motor/light register map for this ship (by LoRa address)
+    def apply_wiring(self):
+        self.motors,self.motor_map,self.lights=wiring_for(self.lora["address"])
 
     # ---- serial / modbus ----
     def open(self):
         if self.ser is None:
             self.ser=serial.Serial(self.tty,BAUD,8,"N",1,timeout=RESP_TO)
-            gpio_set(self.gpio,0)   # ensure TRANSPARENT (relay) mode for normal operation — for ALL channels
+            gpio_set(self.gpio,0)   # TRANSPARENT (relay) mode for normal operation — for ALL channels
     def close(self):
         if self.ser is not None:
             try: self.ser.close()
@@ -115,27 +183,18 @@ class Channel(threading.Thread):
         if ctrl=="enabled":
             self.enabled=(val in ("1","true","on")); is_cmd=False
             if not self.enabled: self.online=False; self.set_mode(OFF); self.close()
-        elif ctrl in MOTOR_MAP and self.online:
-            s,c=MOTOR_MAP[ctrl]; self.motor[ctrl]=max(MOTOR_MIN,min(MOTOR_MAX,iv)); self.write_reg(s,DUTY_REG[c],self.motor[ctrl]); self.pub(ctrl,self.motor[ctrl])
-        elif ctrl.startswith("light") and self.online:
-            i=int(ctrl[5:])-1; k=LIGHTS[i]; self.light[k]=max(0,min(100,iv)); self.write_reg(k[0],DUTY_REG[k[1]],self.light[k]); self.pub(ctrl,self.light[k])
-        elif ctrl=="freq" and self.online:
-            f=max(0,min(20000,iv))
-            for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],f)
-            self.pub("freq",f)
+        elif ctrl in self.motor_map and self.online:
+            s,c=self.motor_map[ctrl]; self.motor[ctrl]=max(MOTOR_MIN,min(MOTOR_MAX,iv)); self.write_reg(s,DUTY_REG[c],self.motor[ctrl]); self.pub(ctrl,self.motor[ctrl])
+        elif ctrl.startswith("light") and self.online and ctrl[5:].isdigit() and 0<int(ctrl[5:])<=len(self.lights):
+            i=int(ctrl[5:]); s,c=self.lights[i-1]; self.light[i]=max(0,min(100,iv)); self.write_reg(s,DUTY_REG[c],self.light[i]); self.pub(ctrl,self.light[i])
         elif ctrl=="mp3_track" and self.online:
-            is_cmd=False; iv=max(0,min(15,iv)); self.send_mp3(mp3_frame(MP3["stop"]) if iv<=0 else mp3_frame(MP3["play"],iv)); self.pub("mp3_track",iv)
+            is_cmd=False; iv=max(0,min(MP3_TRACK_MAX,iv)); self.send_mp3(mp3_frame(MP3["stop"]) if iv<=0 else mp3_frame(MP3["play"],iv)); self.pub("mp3_track",iv)
         elif ctrl=="mp3_volume" and self.online:
-            is_cmd=False; v=max(0,min(30,iv)); self.send_mp3(mp3_frame(MP3["vol"],v)); self.pub("mp3_volume",v)
-        # ---- LoRa modem config ----
-        elif ctrl=="LoRa_channel": is_cmd=False; self.lora["channel"]=iv; self.pub(ctrl,iv); self.pub("LoRa_freq",round(850.125+iv,3))
-        elif ctrl=="LoRa_address": is_cmd=False; self.lora["address"]=iv; self.pub(ctrl,iv); self.lora_op(self.lora)  # apply immediately (ship switch)
-        elif ctrl=="LoRa_air_rate": is_cmd=False; self.lora["air_rate"]=fv; self.pub(ctrl,fv)
-        elif ctrl=="LoRa_power": is_cmd=False; self.lora["power"]=iv; self.pub(ctrl,iv)
-        elif ctrl=="LoRa_read": is_cmd=False; self.lora_op(None)
-        elif ctrl=="LoRa_apply": is_cmd=False; self.lora_op(self.lora)
+            is_cmd=False; v=max(0,min(MP3_VOL_MAX,iv)); self.send_mp3(mp3_frame(MP3["vol"],v)); self.pub("mp3_volume",v)
+        elif ctrl=="ship_number":
+            is_cmd=False; self.lora["address"]=iv; self.pub(ctrl,iv); self.lora_op(self.lora)  # ship number = LoRa address; write modem immediately (ship switch)
         else: is_cmd=False
-        if ctrl in ("enabled","LoRa_channel","LoRa_address","LoRa_air_rate","LoRa_power","LoRa_apply"): self.drv.save()
+        if ctrl in ("enabled","ship_number"): self.drv.save()
         if is_cmd: self.last_cmd=time.monotonic()
     def drain(self):
         while True:
@@ -144,24 +203,28 @@ class Channel(threading.Thread):
             try: self.handle(ctrl,val)
             except Exception as e: print("[%s] cmd err %s %s"%(self.name,ctrl,e),flush=True)
 
-    # ---- LoRa config of THIS channel's modem ----
+    # ---- LoRa modem config of THIS channel's transmitter ----
+    # write=None -> read only (startup); write=dict -> write frame then read back. Both refresh self.lora.
     def lora_op(self,write):
-        self.pub("LoRa_status","applying..." if write else "reading...")
         was_open=self.ser is not None
         try:
             self.open()
             gpio_set(self.gpio,1); time.sleep(0.4)
             if write:
                 air=AIR_CODE.get(("%g"%write["air_rate"]),7); pw=PWR_CODE.get(str(int(write["power"])),0)
-                msg=bytes([0xC0,0x00,0x05,(int(write["address"])>>8)&0xFF,int(write["address"])&0xFF,0x60|air,0x60|pw,int(write["channel"])&0xFF])
+                msg=bytes([0xC0,0x00,0x05,(int(write["address"])>>8)&0xFF,int(write["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(write["channel"])&0xFF])
                 self.ser.reset_input_buffer(); self.ser.write(msg); self.ser.flush(); time.sleep(0.5); self.ser.read(64)
             self.ser.reset_input_buffer(); self.ser.write(bytes([0xC1,0x00,0x08])); self.ser.flush(); time.sleep(0.4); r=self.ser.read(64)
             if len(r)>=11 and r[0]==0xC1:
-                c=r[3:11]; addr=(c[0]<<8)|c[1]
-                self.pub("LoRa_freq",round(850.125+c[4],3))
-                self.pub("LoRa_status","OK ch=%d freq=%.3f air=%s addr=%d power=%s"%(c[4],850.125+c[4],AIR_NAME.get(c[2]&7,"?"),addr,PWR_NAME.get(c[3]&3,"?")))
-            else: self.pub("LoRa_status","ERR no response")
-        except Exception as e: self.pub("LoRa_status","ERR %s"%e)
+                c=r[3:11]
+                self.lora={"channel":c[4],"air_rate":float(AIR_NAME.get(c[2]&7,"62.5")),
+                           "address":(c[0]<<8)|c[1],"power":int(PWR_NAME.get(c[3]&3,"22"))}
+                self.apply_wiring()   # ship changed -> switch motor/light register map to this address
+                self.pub("ship_number",self.lora["address"])
+                print("[%s] lora %s: ch=%d freq=%.3f air=%s addr=%d power=%s"%(self.name,"apply" if write else "read",
+                      c[4],FREQ_BASE+c[4],self.lora["air_rate"],self.lora["address"],self.lora["power"]),flush=True)
+            else: print("[%s] lora %s: no response"%(self.name,"apply" if write else "read"),flush=True)
+        except Exception as e: print("[%s] lora err %s"%(self.name,e),flush=True)
         finally:
             gpio_set(self.gpio,0)
             if not was_open: self.close()
@@ -169,11 +232,10 @@ class Channel(threading.Thread):
     # ---- ship logic ----
     def init_ship(self):
         for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],INIT_FREQ)
-        for n,s,c in MOTORS: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)
-        for s,c in LIGHTS: self.light[(s,c)]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
-        self.pub("freq",INIT_FREQ)
-        for n,s,c in MOTORS: self.pub(n,self.motor[n])
-        for i,k in enumerate(LIGHTS,1): self.pub("light%d"%i,self.light[k])
+        for n,s,c in self.motors: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)
+        for i,(s,c) in enumerate(self.lights,1): self.light[i]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
+        for n,s,c in self.motors: self.pub(n,self.motor[n])
+        for i in range(1,len(self.lights)+1): self.pub("light%d"%i,self.light[i])
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_CUR,1)
         if r is None: return False
@@ -188,23 +250,19 @@ class Channel(threading.Thread):
         self.pub("charge_level",round(r[0]*0.01,1)); return True
     def poll_motors(self):
         ok=True
-        for n,s,c in MOTORS:
+        for n,s,c in self.motors:
             r=self.read_regs(s,3,DUTY_REG[c],1)
             if r is None: ok=False
             else: self.pub(n,r[0])
         return ok
     def poll_lights(self):
         ok=True
-        for i,(s,c) in enumerate(LIGHTS,1):
+        for i,(s,c) in enumerate(self.lights,1):
             r=self.read_regs(s,3,DUTY_REG[c],1)
             if r is None: ok=False
             else: self.pub("light%d"%i,r[0])
         return ok
-    def poll_freq(self):
-        r=self.read_regs(11,3,FREQ_REG[1],1)
-        if r is None: return False
-        self.pub("freq",r[0]); return True
-    GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","motors":"poll_motors","lights":"poll_lights","freq":"poll_freq"}
+    GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","motors":"poll_motors","lights":"poll_lights"}
     def thermal(self):
         t=self.tele.get("temp")
         if t is None: return
@@ -212,7 +270,7 @@ class Channel(threading.Thread):
         if t>T_LIMIT: new=CHG_LOW
         elif t<T_RESTORE: new=CHG_FULL
         if new!=self.chg_setpoint:
-            self.chg_setpoint=new; self.write_reg(UPS,UPS_CHG_SETPOINT,new); self.pub("charge_setpoint",new)
+            self.chg_setpoint=new; self.write_reg(UPS,UPS_CHG_SETPOINT,new)
     def decide(self):
         if not self.online: return SEARCH
         if time.monotonic()-self.last_cmd < SAIL_TIMEOUT: return SAIL
@@ -221,7 +279,7 @@ class Channel(threading.Thread):
         if m!=self.mode:
             self.mode=m; self.pub("mode",m)
             if m==CHARGE:
-                self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL); self.pub("charge_setpoint",CHG_FULL)
+                self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL)
 
     def run(self):
         while True:
@@ -231,6 +289,8 @@ class Channel(threading.Thread):
             if self.drv.service:                          # global Ship-Setup mode: pause radio (free air/wire)
                 self.set_mode(SERVICE); time.sleep(0.5); continue
             self.open()
+            if not self.lora_read:                         # at start: read modem settings once, never auto-write
+                self.lora_op(None); self.lora_read=True
             now=time.monotonic()
             if not self.online:
                 self.set_mode(SEARCH)
@@ -256,49 +316,39 @@ class Driver:
         self.channels={}
         for n,(tty,g) in CHANNELS.items():
             en=st.get(n,{}).get("enabled", n in ENABLED_AT_START)
-            ch=Channel(self,n,tty,g,en)
-            if isinstance(st.get(n,{}).get("lora"),dict): ch.lora.update(st[n]["lora"])
-            self.channels[n]=ch
+            self.channels[n]=Channel(self,n,tty,g,en)
         self.mqtt=None
         self.service=False                       # global Ship-Setup mode (pauses radio channels)
-        self.setup_lora={"channel":14,"air_rate":62.5,"address":3,"power":22}
+        self.setup_number=int(SETUP_DEFAULTS["address"])   # Ship Setup: only the ship number (= LoRa address) is editable
         self.setupq=queue.Queue()
     def load(self):
         try: return json.load(open(STATE_FILE))
         except Exception: return {}
     def save(self):
-        try: json.dump({n:{"enabled":c.enabled,"lora":c.lora} for n,c in self.channels.items()},open(STATE_FILE,"w"))
+        try: json.dump({n:{"enabled":c.enabled} for n,c in self.channels.items()},open(STATE_FILE,"w"))
         except Exception as e: print("state save err",e,flush=True)
     def setup_mqtt(self):
         c=mqtt.Client(CallbackAPIVersion.VERSION1); c.on_connect=self.on_connect; c.on_message=self.on_message
         c.connect("localhost",1883,60); self.mqtt=c; c.loop_start()
     def declare(self):
         for n,ch in self.channels.items():
-            d=ch.dev; P=lambda t,v: self.mqtt.publish("/devices/%s/%s"%(d,t),v,retain=True); o=[0]
-            P("meta/name","Boat %s (%s)"%(n[-1],n.upper()))
+            d=ch.dev; o=[0]
+            self.mqtt.publish("/devices/%s/meta/name"%d,"Boat %s (%s)"%(n[-1],n.upper()),retain=True)
             def ctl(name,meta,val=None,d=d,o=o):
                 o[0]+=1; m=dict(meta,order=o[0])
                 self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
                 if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
             ctl("enabled",{"type":"switch","readonly":False},1 if ch.enabled else 0)
             ctl("mode",{"type":"text","readonly":True})
-            for nm,u in (("battery_current","A"),("battery_temperature","°C"),("charge_level","%"),("charge_setpoint","mA")):
+            for nm,u in (("battery_current","A"),("battery_temperature","°C"),("charge_level","%")):
                 ctl(nm,{"type":"value","readonly":True,"units":u})
-            for n,_,_ in MOTORS: ctl(n,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n]})
-            for i in range(1,6): ctl("light%d"%i,{"type":"range","readonly":False,"min":0,"max":100})
-            ctl("freq",{"type":"value","readonly":False,"min":0,"max":20000,"units":"Hz"})
-            ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":15})
-            ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":30})
-            # LoRa modem config (this channel's transmitter)
-            ctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83},ch.lora["channel"])
-            ctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},round(850.125+ch.lora["channel"],3))
-            ctl("LoRa_air_rate",{"type":"value","readonly":False,"min":0,"max":100,"units":"kbps"},ch.lora["air_rate"])
-            ctl("LoRa_address",{"type":"value","readonly":False,"min":0,"max":65535},ch.lora["address"])
-            ctl("LoRa_power",{"type":"value","readonly":False,"min":0,"max":22,"units":"dBm"},ch.lora["power"])
-            ctl("LoRa_read",{"type":"pushbutton"}); ctl("LoRa_apply",{"type":"pushbutton"})
-            ctl("LoRa_status",{"type":"text","readonly":True})
+            for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
+            for i in range(1,NLIGHTS+1): ctl("light%d"%i,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(i,"Light %d"%i)})
+            ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX})
+            ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX})
+            ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},ch.lora["address"])
             self.mqtt.subscribe("/devices/%s/controls/+/on"%d)
-        # ---- Ship Setup dashboard (RS485-1 wired config) ----
+        # ---- Ship Setup dashboard (RS485-1 wired config) — unchanged ----
         sd="ship_setup"
         self.mqtt.publish("/devices/%s/meta/name"%sd,"Ship Setup (RS485-1)",retain=True)
         so=[0]
@@ -307,12 +357,12 @@ class Driver:
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(sd,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
         sctl("service",{"type":"switch","readonly":False},1 if self.service else 0)
-        sctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83},self.setup_lora["channel"])
-        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},round(850.125+self.setup_lora["channel"],3))
-        sctl("LoRa_air_rate",{"type":"value","readonly":False,"min":0,"max":100,"units":"kbps"},self.setup_lora["air_rate"])
-        sctl("LoRa_address",{"type":"value","readonly":False,"min":0,"max":65535},self.setup_lora["address"])
-        sctl("LoRa_power",{"type":"value","readonly":False,"min":0,"max":22,"units":"dBm"},self.setup_lora["power"])
-        sctl("LoRa_read",{"type":"pushbutton"}); sctl("LoRa_apply",{"type":"pushbutton"})
+        sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},self.setup_number)
+        sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa адрес"},self.setup_number)
+        sctl("LoRa_channel",{"type":"value","readonly":True},"")
+        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},"")
+        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
+        sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
     def on_connect(self,c,u,f,rc,props=None): self.declare()
@@ -330,29 +380,35 @@ class Driver:
     def handle_setup(self,ctrl,val):
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
         if ctrl=="service": self.service=(val in ("1","true","on")); sp("service",1 if self.service else 0)
-        elif ctrl=="LoRa_channel": self.setup_lora["channel"]=int(float(val)); sp(ctrl,self.setup_lora["channel"]); sp("LoRa_freq",round(850.125+self.setup_lora["channel"],3))
-        elif ctrl=="LoRa_address": self.setup_lora["address"]=int(float(val)); sp(ctrl,self.setup_lora["address"])
-        elif ctrl=="LoRa_air_rate": self.setup_lora["air_rate"]=float(val); sp(ctrl,self.setup_lora["air_rate"])
-        elif ctrl=="LoRa_power": self.setup_lora["power"]=int(float(val)); sp(ctrl,self.setup_lora["power"])
-        elif ctrl=="LoRa_read": self.setup_op(None)
-        elif ctrl=="LoRa_apply": self.setup_op(self.setup_lora)
-    def setup_op(self,write):
+        elif ctrl=="ship_number":
+            try: self.setup_number=int(float(val))
+            except Exception: self.setup_number=0
+            sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
+        elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
+        elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
+    def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
-        st("applying..." if write else "reading...")
+        sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
+        radio=None
+        if num is not None:
+            radio=SHIP_RADIO.get(int(num))
+            if radio is None: st("ERR корабль №%s не настроен в конфиге"%num); return
+        st("запись..." if num is not None else "чтение...")
         try:
             ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
-            if write:
-                air=AIR_CODE.get(("%g"%write["air_rate"]),7); pw=PWR_CODE.get(str(int(write["power"])),0)
-                msg=bytes([0xC0,0x00,0x05,(int(write["address"])>>8)&0xFF,int(write["address"])&0xFF,0x60|air,0x60|pw,int(write["channel"])&0xFF])
+            if radio is not None:
+                air=AIR_CODE.get(("%g"%radio["air_rate"]),7); pw=PWR_CODE.get(str(int(radio["power"])),0)
+                msg=bytes([0xC0,0x00,0x05,(int(num)>>8)&0xFF,int(num)&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(radio["channel"])&0xFF])
                 ser.reset_input_buffer(); ser.write(msg); ser.flush(); time.sleep(0.5); ser.read(64)
             ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x08])); ser.flush(); time.sleep(0.4); r=ser.read(64)
             ser.close()
             if len(r)>=11 and r[0]==0xC1:
-                c=r[3:11]; addr=(c[0]<<8)|c[1]
-                self.mqtt.publish("/devices/ship_setup/controls/LoRa_freq",str(round(850.125+c[4],3)),retain=True)
-                st("OK ch=%d freq=%.3f air=%s addr=%d power=%s"%(c[4],850.125+c[4],AIR_NAME.get(c[2]&7,"?"),addr,PWR_NAME.get(c[3]&3,"?")))
+                c=r[3:11]; addr=(c[0]<<8)|c[1]; air_s=AIR_NAME.get(c[2]&7,"?")
+                sp("ship_number",addr); sp("LoRa_address",addr); sp("LoRa_channel",c[4]); sp("LoRa_air_rate",air_s); sp("LoRa_freq",round(FREQ_BASE+c[4],3))
+                self.setup_number=addr
+                st("OK №%d ch=%d freq=%.3f air=%s power=%s"%(addr,c[4],FREQ_BASE+c[4],air_s,PWR_NAME.get(c[3]&3,"?")))
             else:
-                st("ERR no response (ship modem in CONFIG mode?)")
+                st("ERR нет ответа (модем корабля в режиме CONFIG?)")
         except Exception as e: st("ERR %s"%e)
     def start(self):
         self.setup_mqtt(); time.sleep(1.0)
