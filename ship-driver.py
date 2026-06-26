@@ -473,8 +473,8 @@ class Driver:
         for n,ch in self.channels.items():
             if ch.probe(): present[n]=ch; print("module %s: present"%n,flush=True)
             else: self.absent.append(ch.dev); print("module %s: absent -> no dashboard"%n,flush=True)
-        if present: self.channels=present
-        else: print("WARN: no modules detected — keeping all channels",flush=True); self.absent=[]
+        self.channels=present   # dashboards only for modules that actually responded (no fallback)
+        if not present: print("no MOD modules responded — only Ship Setup will be shown",flush=True)
         self.setup_mqtt(); time.sleep(1.0)
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
