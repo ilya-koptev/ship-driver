@@ -334,8 +334,6 @@ class Channel(threading.Thread):
             self.drain()
             if not self.enabled:
                 self.set_mode(OFF); time.sleep(0.5); continue
-            if self.drv.service:                          # global Ship-Setup mode: pause radio (free air/wire)
-                self.set_mode(SERVICE); time.sleep(0.5); continue
             self.open()
             if not self.lora_read:                         # at start: read modem settings once (read-only, never auto-write)
                 self.lora_op(None); self.lora_read=True
@@ -366,7 +364,6 @@ class Driver:
             en=st.get(n,{}).get("enabled", n in ENABLED_AT_START)
             self.channels[n]=Channel(self,n,tty,g,en)
         self.mqtt=None
-        self.service=False                       # global Ship-Setup mode (pauses radio channels)
         self.setup_number=int(SETUP_DEFAULTS["address"])   # Ship Setup: only the ship number (= LoRa address) is editable
         self.setupq=queue.Queue()
     def load(self):
@@ -409,7 +406,6 @@ class Driver:
             so[0]+=1; m=dict(meta,order=so[0])
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(sd,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
-        sctl("service",{"type":"switch","readonly":False},1 if self.service else 0)
         sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},self.setup_number)
         sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa адрес"},self.setup_number)
         sctl("LoRa_channel",{"type":"value","readonly":True},"")
@@ -438,8 +434,7 @@ class Driver:
             except Exception as e: print("setup err",ctrl,e,flush=True)
     def handle_setup(self,ctrl,val):
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
-        if ctrl=="service": self.service=(val in ("1","true","on")); sp("service",1 if self.service else 0)
-        elif ctrl=="ship_number":
+        if ctrl=="ship_number":
             try: self.setup_number=int(float(val))
             except Exception: self.setup_number=0
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
