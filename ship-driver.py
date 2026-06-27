@@ -150,6 +150,26 @@ def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xF
 AIR_CODE={"2.4":2,"4.8":3,"9.6":4,"19.2":5,"38.4":6,"62.5":7}
 AIR_NAME={0:"2.4",1:"2.4",2:"2.4",3:"4.8",4:"9.6",5:"19.2",6:"38.4",7:"62.5"}
 PWR_CODE={"22":0,"17":1,"13":2,"10":3}; PWR_NAME={0:"22",1:"17",2:"13",3:"10"}
+# E220 register decode tables (per datasheet)
+BAUD_NAMES={0:"1200",1:"2400",2:"4800",3:"9600",4:"19200",5:"38400",6:"57600",7:"115200"}
+PARITY_NAMES={0:"8N1",1:"8O1",2:"8E1",3:"8N1"}
+SUBPKT_NAMES={0:"200",1:"128",2:"64",3:"32"}
+WOR_NAMES={0:"500",1:"1000",2:"1500",3:"2000",4:"2500",5:"3000",6:"3500",7:"4000"}
+def decode_e220(b):   # b = 9 register bytes (0x00..0x08); 0x08 = version. Returns decoded fields.
+    d={}
+    d["address"]=(b[0]<<8)|b[1]
+    d["uart"]=BAUD_NAMES.get((b[2]>>5)&7,"?")+" "+PARITY_NAMES.get((b[2]>>3)&3,"?")
+    d["air_rate"]=AIR_NAME.get(b[2]&7,"?")
+    d["subpacket"]=SUBPKT_NAMES.get((b[3]>>6)&3,"?")
+    d["rssi_ambient"]="вкл" if (b[3]>>5)&1 else "выкл"
+    d["power"]=PWR_NAME.get(b[3]&3,"?")
+    d["channel"]=b[4]
+    d["rssi_byte"]="вкл" if (b[5]>>7)&1 else "выкл"
+    d["mode"]="fixed" if (b[5]>>6)&1 else "transparent"
+    d["lbt"]="вкл" if (b[5]>>4)&1 else "выкл"
+    d["wor"]=WOR_NAMES.get(b[5]&7,"?")
+    d["version"]="0x%02x"%b[8] if len(b)>8 else "?"
+    return d
 
 def crc16(d):
     c=0xFFFF
@@ -419,6 +439,14 @@ class Driver:
         sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},self.setup_air)
         sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm"},self.setup_power)
         sctl("LoRa_lbt",{"type":"text","readonly":True,"title":"LBT"},"")
+        sctl("LoRa_uart",{"type":"text","readonly":True,"title":"UART"},"")
+        sctl("LoRa_subpacket",{"type":"value","readonly":True,"units":"байт","title":"Субпакет"},"")
+        sctl("LoRa_rssi_ambient",{"type":"text","readonly":True,"title":"RSSI эфира"},"")
+        sctl("LoRa_rssi_byte",{"type":"text","readonly":True,"title":"RSSI в пакете"},"")
+        sctl("LoRa_mode",{"type":"text","readonly":True,"title":"Режим TX"},"")
+        sctl("LoRa_wor",{"type":"value","readonly":True,"units":"ms","title":"WOR период"},"")
+        sctl("LoRa_version",{"type":"text","readonly":True,"title":"Версия"},"")
+        sctl("LoRa_raw",{"type":"text","readonly":True,"title":"raw (9 байт)"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
@@ -462,14 +490,18 @@ class Driver:
                 air=AIR_CODE.get(("%g"%self.setup_air),7); pw=PWR_CODE.get(str(int(self.setup_power)),0)
                 msg=bytes([0xC0,0x00,0x08,(self.setup_number>>8)&0xFF,self.setup_number&0xFF,SPED_BASE|air,OPTION_BASE|pw,self.setup_channel&0xFF,REG5_TXMODE,0x00,0x00])
                 ser.reset_input_buffer(); ser.write(msg); ser.flush(); time.sleep(0.5); ser.read(64)
-            ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x08])); ser.flush(); time.sleep(0.4); r=ser.read(64)
+            ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x09])); ser.flush(); time.sleep(0.4); r=ser.read(64)
             ser.close()
-            if len(r)>=11 and r[0]==0xC1:
-                c=r[3:11]; addr=(c[0]<<8)|c[1]; ch=c[4]; air_s=AIR_NAME.get(c[2]&7,"?"); pw_s=PWR_NAME.get(c[3]&3,"?"); lbt="вкл" if c[5]&0x10 else "выкл"
-                self.setup_number=addr; self.setup_channel=ch; self.setup_air=float(air_s); self.setup_power=int(pw_s) if pw_s!="?" else self.setup_power
+            if len(r)>=12 and r[0]==0xC1:
+                b=r[3:12]; d=decode_e220(b); addr=d["address"]; ch=d["channel"]
+                self.setup_number=addr; self.setup_channel=ch
+                if d["air_rate"]!="?": self.setup_air=float(d["air_rate"])
+                if d["power"]!="?": self.setup_power=int(d["power"])
                 sp("ship_number",addr); sp("LoRa_address",addr); sp("LoRa_channel",ch); sp("LoRa_freq",round(FREQ_BASE+ch,3)); sp("LoRa_grkch",grkch(ch))
-                sp("LoRa_air_rate",air_s); sp("LoRa_power",pw_s); sp("LoRa_lbt",lbt)
-                st("OK №%d ch=%d freq=%.3f %s air=%s power=%s LBT=%s raw=%s"%(addr,ch,FREQ_BASE+ch,grkch(ch),air_s,pw_s,lbt,c.hex()))
+                sp("LoRa_air_rate",d["air_rate"]); sp("LoRa_power",d["power"]); sp("LoRa_lbt",d["lbt"])
+                sp("LoRa_uart",d["uart"]); sp("LoRa_subpacket",d["subpacket"]); sp("LoRa_rssi_ambient",d["rssi_ambient"])
+                sp("LoRa_rssi_byte",d["rssi_byte"]); sp("LoRa_mode",d["mode"]); sp("LoRa_wor",d["wor"]); sp("LoRa_version",d["version"]); sp("LoRa_raw",b.hex())
+                st("OK №%d ch=%d %s air=%s power=%s LBT=%s ver=%s raw=%s"%(addr,ch,grkch(ch),d["air_rate"],d["power"],d["lbt"],d["version"],b.hex()))
             else:
                 st("ERR нет ответа (модем корабля в режиме CONFIG?)")
         except Exception as e: st("ERR %s"%e)
