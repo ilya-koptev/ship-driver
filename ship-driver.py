@@ -312,6 +312,10 @@ class Channel(threading.Thread):
         r=self.read_regs(UPS,4,UPS_CUR,1)
         if r is None: return False
         self.tele["current"]=s16(r[0])*0.001; self.pub("battery_current",round(self.tele["current"],3)); return True
+    def pwm_alive(self):   # ship reachable via pwm even when UPS is off — probe each pwm8a04 frequency register
+        for s in PWM_SLAVES:
+            if self.read_regs(s,3,FREQ_REG[1],1) is not None: return True
+        return False
     def poll_temp(self):
         r=self.read_regs(UPS,4,UPS_TEMP,1)
         if r is None: return False
@@ -365,7 +369,7 @@ class Channel(threading.Thread):
             now=time.monotonic()
             if not self.online:
                 self.set_mode(SEARCH)
-                if self.poll_current(): self.fails=0; self.online=True; self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())
+                if self.poll_current() or self.pwm_alive(): self.fails=0; self.online=True; self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())
                 else: time.sleep(SEARCH_PERIOD)
                 continue
             self.set_mode(self.decide())
@@ -374,7 +378,7 @@ class Channel(threading.Thread):
                 if now>=self.due.get(g,0):
                     ok=getattr(self,self.GROUPS[g])(); self.due[g]=now+per; did=True
                     if g=="current":
-                        if ok: self.fails=0
+                        if ok or self.pwm_alive(): self.fails=0   # UPS may be off; ship still alive if any pwm8a04 answers
                         else:
                             self.fails+=1
                             if self.fails>=OFFLINE_FAILS: self.online=False; self.set_mode(SEARCH)
