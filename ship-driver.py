@@ -243,6 +243,10 @@ class Channel(threading.Thread):
         for c in ("battery_current","battery_temperature","charge_level"): self.puberr(c,err)
         for n,_,_ in self.motors: self.puberr(n,err)
         for i in range(1,len(self.lights)+1): self.puberr("light%d"%i,err)
+    def reset_defaults(self):   # ship offline -> show default values on the dashboard (motors idle, lights off, track stopped)
+        for n in MOTOR_NAMES: self.motor[n]=INIT_MOTOR; self.pub(n,INIT_MOTOR)
+        for i in range(1,NLIGHTS+1): self.light[i]=INIT_LIGHT; self.pub("light%d"%i,INIT_LIGHT)
+        self.pub("mp3_track",0)
 
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
@@ -362,7 +366,7 @@ class Channel(threading.Thread):
     def set_mode(self,m):
         if m!=self.mode:
             self.mode=m; self.pub("mode",m)
-            if m in (SEARCH,OFF): self.set_all_err("r")   # ship unreachable -> grey out readable controls
+            if m in (SEARCH,OFF): self.set_all_err("r"); self.reset_defaults()   # ship unreachable -> grey out + reset displayed values to defaults
             if m==CHARGE:
                 self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL)
             if m==OFF: gpio_set(self.gpio,1)   # disabled -> put MOD modem into config mode (off-air)
