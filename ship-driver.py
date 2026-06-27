@@ -237,6 +237,12 @@ class Channel(threading.Thread):
     # ---- MQTT helpers ----
     def pub(self,ctrl,val):
         if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s"%(self.dev,ctrl),str(val),retain=True)
+    def puberr(self,ctrl,err):   # WB convention: /controls/<c>/meta/error = "r" (read error) -> homeui greys/colours it; "" = ok
+        if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(self.dev,ctrl),err,retain=True)
+    def set_all_err(self,err):   # mark every readable control (telemetry + motors + lights)
+        for c in ("battery_current","battery_temperature","charge_level"): self.puberr(c,err)
+        for n,_,_ in self.motors: self.puberr(n,err)
+        for i in range(1,len(self.lights)+1): self.puberr("light%d"%i,err)
 
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
@@ -311,33 +317,33 @@ class Channel(threading.Thread):
         for i in range(1,len(self.lights)+1): self.pub("light%d"%i,self.light[i])
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_CUR,1)
-        if r is None: return False
-        self.tele["current"]=s16(r[0])*0.001; self.pub("battery_current",round(self.tele["current"],3)); return True
+        if r is None: self.puberr("battery_current","r"); return False
+        self.tele["current"]=s16(r[0])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current",""); return True
     def pwm_alive(self):   # ship reachable via pwm even when UPS is off — probe each pwm8a04 frequency register
         for s in PWM_SLAVES:
             if self.read_regs(s,3,FREQ_REG[1],1) is not None: return True
         return False
     def poll_temp(self):
         r=self.read_regs(UPS,4,UPS_TEMP,1)
-        if r is None: return False
-        self.tele["temp"]=s16(r[0])*0.01; self.pub("battery_temperature",round(self.tele["temp"],2)); return True
+        if r is None: self.puberr("battery_temperature","r"); return False
+        self.tele["temp"]=s16(r[0])*0.01; self.pub("battery_temperature",round(self.tele["temp"],2)); self.puberr("battery_temperature",""); return True
     def poll_charge(self):
         r=self.read_regs(UPS,4,UPS_CHG,1)
-        if r is None: return False
-        self.pub("charge_level",round(r[0]*0.01,1)); return True
+        if r is None: self.puberr("charge_level","r"); return False
+        self.pub("charge_level",round(r[0]*0.01,1)); self.puberr("charge_level",""); return True
     def poll_motors(self):
         ok=True
         for n,s,c in self.motors:
             r=self.read_regs(s,3,DUTY_REG[c],1)
-            if r is None: ok=False
-            else: self.pub(n,r[0])
+            if r is None: ok=False; self.puberr(n,"r")
+            else: self.pub(n,r[0]); self.puberr(n,"")
         return ok
     def poll_lights(self):
         ok=True
         for i,(s,c) in enumerate(self.lights,1):
             r=self.read_regs(s,3,DUTY_REG[c],1)
-            if r is None: ok=False
-            else: self.pub("light%d"%i,r[0])
+            if r is None: ok=False; self.puberr("light%d"%i,"r")
+            else: self.pub("light%d"%i,r[0]); self.puberr("light%d"%i,"")
         return ok
     GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","motors":"poll_motors","lights":"poll_lights"}
     def thermal(self):
@@ -355,6 +361,7 @@ class Channel(threading.Thread):
     def set_mode(self,m):
         if m!=self.mode:
             self.mode=m; self.pub("mode",m)
+            if m in (SEARCH,OFF): self.set_all_err("r")   # ship unreachable -> grey out readable controls
             if m==CHARGE:
                 self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL)
             if m==OFF: gpio_set(self.gpio,1)   # disabled -> put MOD modem into config mode (off-air)
