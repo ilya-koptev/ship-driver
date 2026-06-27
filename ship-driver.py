@@ -145,6 +145,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 LIGHT_TITLE={4:"Ходовые огни",5:"Внутренняя подсветка"}   # dashboard titles (others default to "Light N")
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]
+BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode")]   # shown only while polling (online); removed in SEARCH/OFF
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
 def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xFF,param&0xFF,0xEF])
@@ -196,6 +197,7 @@ class Channel(threading.Thread):
         self.dev="boat"+name[-1]; self.enabled=enabled
         self.ser=None; self.q=queue.Queue()
         self.mode=None; self.online=False; self.fails=0   # mode=None so the first set_mode always fires (incl. OFF gpio)
+        self.declared_full=False   # whether the full control set is currently published (vs collapsed to enabled+mode)
         self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={i:0 for i in range(1,NLIGHTS+1)}
@@ -239,14 +241,6 @@ class Channel(threading.Thread):
         if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s"%(self.dev,ctrl),str(val),retain=True)
     def puberr(self,ctrl,err):   # WB convention: /controls/<c>/meta/error = "r" (read error) -> homeui greys/colours it; "" = ok
         if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(self.dev,ctrl),err,retain=True)
-    def set_all_err(self,err):   # mark every readable control (telemetry + motors + lights)
-        for c in ("battery_current","battery_temperature","charge_level"): self.puberr(c,err)
-        for n,_,_ in self.motors: self.puberr(n,err)
-        for i in range(1,len(self.lights)+1): self.puberr("light%d"%i,err)
-    def reset_defaults(self):   # ship offline -> show default values on the dashboard (motors idle, lights off, track stopped)
-        for n in MOTOR_NAMES: self.motor[n]=INIT_MOTOR; self.pub(n,INIT_MOTOR)
-        for i in range(1,NLIGHTS+1): self.light[i]=INIT_LIGHT; self.pub("light%d"%i,INIT_LIGHT)
-        self.pub("mp3_track",0)
 
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
@@ -366,7 +360,8 @@ class Channel(threading.Thread):
     def set_mode(self,m):
         if m!=self.mode:
             self.mode=m; self.pub("mode",m)
-            if m in (SEARCH,OFF): self.set_all_err("r"); self.reset_defaults()   # ship unreachable -> grey out + reset displayed values to defaults
+            want_full=(m not in (SEARCH,OFF))   # polling -> show full dashboard; not polling -> only enabled+mode
+            if want_full!=self.declared_full: self.drv.boat_controls(self,want_full)
             if m==CHARGE:
                 self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL)
             if m==OFF: gpio_set(self.gpio,1)   # disabled -> put MOD modem into config mode (off-air)
@@ -382,7 +377,10 @@ class Channel(threading.Thread):
             now=time.monotonic()
             if not self.online:
                 self.set_mode(SEARCH)
-                if self.poll_current() or self.pwm_alive(): self.fails=0; self.online=True; self.due={}; self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())   # due={} -> re-poll all groups at once on (re)connect so motor/light errors clear immediately, not after 300s
+                if self.poll_current() or self.pwm_alive():
+                    self.fails=0; self.online=True; self.due={}   # due={} -> re-poll all groups at once on (re)connect
+                    self.drv.boat_controls(self,True)             # restore full dashboard before init/poll fills values
+                    self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())
                 else: time.sleep(SEARCH_PERIOD)
                 continue
             self.set_mode(self.decide())
@@ -432,16 +430,18 @@ class Driver:
         # /meta/name is legacy (older WB7). Publish both.
         self.mqtt.publish("/devices/%s/meta"%dev,json.dumps({"driver":"ship-driver","title":{"en":title,"ru":title}}),retain=True)
         self.mqtt.publish("/devices/%s/meta/name"%dev,title,retain=True)
-    def declare(self):
-        for n,ch in self.channels.items():
-            d=ch.dev; o=[0]
-            self.setname(d,"boat%s (channel %s)"%(n[-1],ch.lora["channel"]))
-            def ctl(name,meta,val=None,d=d,o=o):
-                o[0]+=1; m=dict(meta,order=o[0])
-                self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
-                if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
-            ctl("enabled",{"type":"switch","readonly":False},1 if ch.enabled else 0)
-            ctl("mode",{"type":"text","readonly":True})
+    def boat_controls(self,ch,full):
+        # full=True: publish the whole dashboard; full=False: keep only enabled+mode, remove the rest
+        # (the "extra" controls are telemetry/commands that only make sense while the channel polls a live ship).
+        if self.mqtt is None: return
+        d=ch.dev; o=[0]
+        def ctl(name,meta,val=None):
+            o[0]+=1; m=dict(meta,order=o[0])
+            self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
+            if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
+        ctl("enabled",{"type":"switch","readonly":False},1 if ch.enabled else 0)
+        ctl("mode",{"type":"text","readonly":True})
+        if full:
             for nm,u in (("battery_current","A"),("battery_temperature","°C"),("charge_level","%")):
                 ctl(nm,{"type":"value","readonly":True,"units":u})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
@@ -449,7 +449,16 @@ class Driver:
             ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX})
             ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX})
             ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},ch.lora["address"])
-            self.mqtt.subscribe("/devices/%s/controls/+/on"%d)
+        else:
+            for c in BOAT_EXTRA:   # remove control: clear its meta, error flag and value
+                for sub in ("/meta","/meta/error",""):
+                    self.mqtt.publish("/devices/%s/controls/%s%s"%(d,c,sub),"",retain=True)
+        ch.declared_full=full
+    def declare(self):
+        for n,ch in self.channels.items():
+            self.setname(ch.dev,"boat%s (channel %s)"%(n[-1],ch.lora["channel"]))
+            self.boat_controls(ch, ch.online and ch.enabled)   # collapsed until the channel actually polls a ship
+            self.mqtt.subscribe("/devices/%s/controls/+/on"%ch.dev)
         # ---- Ship Setup dashboard (RS485-1 wired config) — unchanged ----
         sd="ship_setup"
         self.setname(sd,"Ship Setup (RS485-1)")
