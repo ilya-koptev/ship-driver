@@ -122,7 +122,7 @@ LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
 GRKCH_CHANNELS={14,16,17,19}   # ГКРЧ-allowed LoRa channels
 def grkch(ch):
-    try: return "✓ ГКРЧ" if int(ch) in GRKCH_CHANNELS else "⚠ вне ГКРЧ"
+    try: return "✓ in band (GKRCh)" if int(ch) in GRKCH_CHANNELS else "⚠ out of band"
     except Exception: return "?"
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
 ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
@@ -141,9 +141,9 @@ def wiring_for(addr):
 # control set is the SAME on every ship -> names/count fixed (from default), only the register mapping varies per ship
 MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
 NLIGHTS=len(DEFAULT_WIRING[2])
-_MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
+_MT={"front_right":"Bow starboard","back_right":"Stern starboard","front_left":"Bow port","back_left":"Stern port"}
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
-LIGHT_TITLE={1:"Ходовые огни",2:"Прожектор морзе",3:"Палубные огни",4:"Внутренний свет 1",5:"Внутренний свет 2"}   # dashboard titles
+LIGHT_TITLE={1:"Navigation lights",2:"Morse signal lamp",3:"Deck lights",4:"Cabin light 1",5:"Cabin light 2"}   # dashboard titles (nautical, English)
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 
@@ -163,12 +163,12 @@ def decode_e220(b):   # b = 9 register bytes (0x00..0x08); 0x08 = version. Retur
     d["uart"]=BAUD_NAMES.get((b[2]>>5)&7,"?")+" "+PARITY_NAMES.get((b[2]>>3)&3,"?")
     d["air_rate"]=AIR_NAME.get(b[2]&7,"?")
     d["subpacket"]=SUBPKT_NAMES.get((b[3]>>6)&3,"?")
-    d["rssi_ambient"]="вкл" if (b[3]>>5)&1 else "выкл"
+    d["rssi_ambient"]="on" if (b[3]>>5)&1 else "off"
     d["power"]=PWR_NAME.get(b[3]&3,"?")
     d["channel"]=b[4]
-    d["rssi_byte"]="вкл" if (b[5]>>7)&1 else "выкл"
+    d["rssi_byte"]="on" if (b[5]>>7)&1 else "off"
     d["mode"]="fixed" if (b[5]>>6)&1 else "transparent"
-    d["lbt"]="вкл" if (b[5]>>4)&1 else "выкл"
+    d["lbt"]="on" if (b[5]>>4)&1 else "off"
     d["wor"]=WOR_NAMES.get(b[5]&7,"?")
     d["version"]="0x%02x"%b[8] if len(b)>8 else "?"
     return d
@@ -440,16 +440,16 @@ class Driver:
             if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
-        ctl("enabled",{"type":"switch","readonly":False},1 if ch.enabled else 0)
-        ctl("mode",{"type":"text","readonly":True})
-        ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},ch.lora["address"])   # always visible (set ship even while searching)
+        ctl("enabled",{"type":"switch","readonly":False,"title":"Enabled"},1 if ch.enabled else 0)
+        ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
+        ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u in (("battery_current","A"),("battery_temperature","°C"),("charge_level","%")):
-                ctl(nm,{"type":"value","readonly":True,"units":u})
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level")):
+                ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for i in range(1,NLIGHTS+1): ctl("light%d"%i,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(i,"Light %d"%i)})
-            ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX})
-            ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX})
+            ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"})
+            ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"})
         else:
             for c in BOAT_EXTRA:   # remove control: clear its meta, error flag and value
                 for sub in ("/meta","/meta/error",""):
@@ -469,24 +469,24 @@ class Driver:
             if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(sd,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
-        sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},self.setup_number)
-        sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa адрес"},self.setup_number)
-        sctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83,"title":"LoRa канал"},self.setup_channel)
-        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},round(FREQ_BASE+self.setup_channel,3))
-        sctl("LoRa_grkch",{"type":"text","readonly":True,"title":"ГКРЧ"},grkch(self.setup_channel))
-        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},self.setup_air)
-        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm"},self.setup_power)
+        sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},self.setup_number)
+        sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa address"},self.setup_number)
+        sctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83,"title":"LoRa channel"},self.setup_channel)
+        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz","title":"Frequency"},round(FREQ_BASE+self.setup_channel,3))
+        sctl("LoRa_grkch",{"type":"text","readonly":True,"title":"Band (GKRCh)"},grkch(self.setup_channel))
+        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps","title":"Air rate"},self.setup_air)
+        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm","title":"Power"},self.setup_power)
         sctl("LoRa_lbt",{"type":"text","readonly":True,"title":"LBT"},"")
         sctl("LoRa_uart",{"type":"text","readonly":True,"title":"UART"},"")
-        sctl("LoRa_subpacket",{"type":"value","readonly":True,"units":"байт","title":"Субпакет"},"")
-        sctl("LoRa_rssi_ambient",{"type":"text","readonly":True,"title":"RSSI эфира"},"")
-        sctl("LoRa_rssi_byte",{"type":"text","readonly":True,"title":"RSSI в пакете"},"")
-        sctl("LoRa_mode",{"type":"text","readonly":True,"title":"Режим TX"},"")
-        sctl("LoRa_wor",{"type":"value","readonly":True,"units":"ms","title":"WOR период"},"")
-        sctl("LoRa_version",{"type":"text","readonly":True,"title":"Версия"},"")
-        sctl("LoRa_raw",{"type":"text","readonly":True,"title":"raw (9 байт)"},"")
+        sctl("LoRa_subpacket",{"type":"value","readonly":True,"units":"bytes","title":"Subpacket"},"")
+        sctl("LoRa_rssi_ambient",{"type":"text","readonly":True,"title":"Ambient RSSI"},"")
+        sctl("LoRa_rssi_byte",{"type":"text","readonly":True,"title":"Packet RSSI"},"")
+        sctl("LoRa_mode",{"type":"text","readonly":True,"title":"TX mode"},"")
+        sctl("LoRa_wor",{"type":"value","readonly":True,"units":"ms","title":"WOR period"},"")
+        sctl("LoRa_version",{"type":"text","readonly":True,"title":"Version"},"")
+        sctl("LoRa_raw",{"type":"text","readonly":True,"title":"raw (9 bytes)"},"")
         sctl("LoRa_default",{"type":"text","readonly":True,"title":"LoRa default"},LORA_DEFAULT_RAW)
-        sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
+        sctl("LoRa_read",{"type":"pushbutton","title":"Read"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Write"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
