@@ -408,9 +408,11 @@ class Driver:
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
         sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},self.setup_number)
         sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa адрес"},self.setup_number)
-        sctl("LoRa_channel",{"type":"value","readonly":True},"")
-        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},"")
+        sctl("LoRa_channel",{"type":"value","readonly":True,"title":"LoRa канал"},"")
         sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
+        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},"")
+        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm"},"")
+        sctl("LoRa_lbt",{"type":"text","readonly":True,"title":"LBT"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
@@ -459,6 +461,7 @@ class Driver:
             if len(r)>=11 and r[0]==0xC1:
                 c=r[3:11]; addr=(c[0]<<8)|c[1]; air_s=AIR_NAME.get(c[2]&7,"?")
                 sp("ship_number",addr); sp("LoRa_address",addr); sp("LoRa_channel",c[4]); sp("LoRa_air_rate",air_s); sp("LoRa_freq",round(FREQ_BASE+c[4],3))
+                sp("LoRa_power",PWR_NAME.get(c[3]&3,"?")); sp("LoRa_lbt","вкл" if c[5]&0x10 else "выкл")
                 self.setup_number=addr
                 st("OK №%d ch=%d freq=%.3f air=%s power=%s reg5=0x%02x raw=%s"%(addr,c[4],FREQ_BASE+c[4],air_s,PWR_NAME.get(c[3]&3,"?"),c[5],c.hex()))
             else:
