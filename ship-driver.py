@@ -409,7 +409,7 @@ class Driver:
     def declare(self):
         for n,ch in self.channels.items():
             d=ch.dev; o=[0]
-            self.mqtt.publish("/devices/%s/meta/name"%d,"Boat %s (%s)"%(n[-1],n.upper()),retain=True)
+            self.mqtt.publish("/devices/%s/meta/name"%d,"boat%s (ch %s)"%(n[-1],ch.lora["channel"]),retain=True)
             def ctl(name,meta,val=None,d=d,o=o):
                 o[0]+=1; m=dict(meta,order=o[0])
                 self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
