@@ -378,7 +378,7 @@ class Channel(threading.Thread):
             now=time.monotonic()
             if not self.online:
                 self.set_mode(SEARCH)
-                if self.poll_current() or self.pwm_alive(): self.fails=0; self.online=True; self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())
+                if self.poll_current() or self.pwm_alive(): self.fails=0; self.online=True; self.due={}; self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())   # due={} -> re-poll all groups at once on (re)connect so motor/light errors clear immediately, not after 300s
                 else: time.sleep(SEARCH_PERIOD)
                 continue
             self.set_mode(self.decide())
