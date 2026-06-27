@@ -303,8 +303,9 @@ class Channel(threading.Thread):
 
     # ---- ship logic ----
     def init_ship(self):
-        for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],INIT_FREQ)
-        for n,s,c in self.motors: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)
+        for s,c in ALL_CH: self.write_reg(s,DUTY_REG[c],0)          # 1) power (duty) off on every channel first
+        for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],INIT_FREQ)  # 2) then pwm frequency = 400
+        for n,s,c in self.motors: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)  # 3) then motors to idle (40)
         for i,(s,c) in enumerate(self.lights,1): self.light[i]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
         for n,s,c in self.motors: self.pub(n,self.motor[n])
         for i in range(1,len(self.lights)+1): self.pub("light%d"%i,self.light[i])
