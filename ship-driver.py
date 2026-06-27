@@ -86,8 +86,8 @@ DEFAULTS={
      "air_rate":62.5,"power":22,
      "motors":{"back_left":{"slave":12,"channel":1},"front_left":{"slave":12,"channel":2},
                "back_right":{"slave":11,"channel":1},"front_right":{"slave":11,"channel":2}},
-     "lights":{"light1":{"slave":11,"channel":3},"light2":{"slave":12,"channel":3},"light3":{"slave":13,"channel":1},
-               "light4":{"slave":13,"channel":2},"light5":{"slave":13,"channel":3}}},
+     "lights":{"nav_lights":{"slave":11,"channel":3},"morse_lamp":{"slave":12,"channel":3},"deck_lights":{"slave":13,"channel":1},
+               "cabin_light1":{"slave":13,"channel":2},"cabin_light2":{"slave":13,"channel":3}}},
    "list":[],   # per ship: {"address":N,"channel":C,"motors":{...},"lights":{...}}
  },
 }
@@ -126,9 +126,9 @@ def grkch(ch):
     except Exception: return "?"
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
 ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
-def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[(slave,ch)] in light1..N order)
+def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[(name,slave,ch)] in conf order)
     motors=[(n,m["slave"],m["channel"]) for n,m in w["motors"].items()]
-    lights=[(w["lights"][k]["slave"],w["lights"][k]["channel"]) for k in sorted(w["lights"],key=lambda x:int(x[5:]))]
+    lights=[(n,l["slave"],l["channel"]) for n,l in w["lights"].items()]
     return motors,{n:(s,c) for n,s,c in motors},lights
 SD=C["ships"]; SHIP_DEFAULT=SD["default"]; SHIP_LIST=SD.get("list",[])
 DEFAULT_WIRING=parse_wiring(SHIP_DEFAULT)                       # fallback wiring (address not in list)
@@ -140,11 +140,13 @@ def wiring_for(addr):
     except Exception: return DEFAULT_WIRING
 # control set is the SAME on every ship -> names/count fixed (from default), only the register mapping varies per ship
 MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
-NLIGHTS=len(DEFAULT_WIRING[2])
+LIGHT_NAMES=[n for n,_,_ in DEFAULT_WIRING[2]]
+NLIGHTS=len(LIGHT_NAMES)
 _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
-LIGHT_TITLE={1:"Navigation lights",2:"Morse signal lamp",3:"Deck lights",4:"Cabin light 1",5:"Cabin light 2"}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]
+_LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
+LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
@@ -200,12 +202,13 @@ class Channel(threading.Thread):
         self.declared_full=False   # whether the full control set is currently published (vs collapsed to enabled+mode)
         self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}
-        self.motor={n:0 for n in MOTOR_NAMES}; self.light={i:0 for i in range(1,NLIGHTS+1)}
+        self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
         self.apply_wiring()               # pick motor/light register map for this ship (by LoRa address)
     def apply_wiring(self):
         self.motors,self.motor_map,self.lights=wiring_for(self.lora["address"])
+        self.light_map={n:(s,c) for n,s,c in self.lights}
 
     # ---- serial / modbus ----
     def open(self):
@@ -252,8 +255,8 @@ class Channel(threading.Thread):
             if not self.enabled: self.online=False; self.set_mode(OFF); self.close()
         elif ctrl in self.motor_map and self.online:
             s,c=self.motor_map[ctrl]; self.motor[ctrl]=max(MOTOR_MIN,min(MOTOR_MAX,iv)); self.write_reg(s,DUTY_REG[c],self.motor[ctrl]); self.pub(ctrl,self.motor[ctrl])
-        elif ctrl.startswith("light") and self.online and ctrl[5:].isdigit() and 0<int(ctrl[5:])<=len(self.lights):
-            i=int(ctrl[5:]); s,c=self.lights[i-1]; self.light[i]=max(0,min(100,iv)); self.write_reg(s,DUTY_REG[c],self.light[i]); self.pub(ctrl,self.light[i])
+        elif ctrl in self.light_map and self.online:
+            s,c=self.light_map[ctrl]; self.light[ctrl]=max(0,min(100,iv)); self.write_reg(s,DUTY_REG[c],self.light[ctrl]); self.pub(ctrl,self.light[ctrl])
         elif ctrl=="mp3_track" and self.online:
             is_cmd=False; iv=max(0,min(MP3_TRACK_MAX,iv)); self.send_mp3(mp3_frame(MP3["stop"]) if iv<=0 else mp3_frame(MP3["play"],iv)); self.pub("mp3_track",iv)
         elif ctrl=="mp3_volume" and self.online:
@@ -311,9 +314,9 @@ class Channel(threading.Thread):
         for s,c in ALL_CH: self.write_reg(s,DUTY_REG[c],0)          # 1) power (duty) off on every channel first
         for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],INIT_FREQ)  # 2) then pwm frequency = 400
         for n,s,c in self.motors: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)  # 3) then motors to idle (40)
-        for i,(s,c) in enumerate(self.lights,1): self.light[i]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
+        for n,s,c in self.lights: self.light[n]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
         for n,s,c in self.motors: self.pub(n,self.motor[n])
-        for i in range(1,len(self.lights)+1): self.pub("light%d"%i,self.light[i])
+        for n,s,c in self.lights: self.pub(n,self.light[n])
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_CUR,1)
         if r is None: self.puberr("battery_current","r"); return False
@@ -339,10 +342,10 @@ class Channel(threading.Thread):
         return ok
     def poll_lights(self):
         ok=True
-        for i,(s,c) in enumerate(self.lights,1):
+        for n,s,c in self.lights:
             r=self.read_regs(s,3,DUTY_REG[c],1)
-            if r is None: ok=False; self.puberr("light%d"%i,"r")
-            else: self.pub("light%d"%i,r[0]); self.puberr("light%d"%i,"")
+            if r is None: ok=False; self.puberr(n,"r")
+            else: self.pub(n,r[0]); self.puberr(n,"")
         return ok
     GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","motors":"poll_motors","lights":"poll_lights"}
     def thermal(self):
@@ -447,7 +450,7 @@ class Driver:
             for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
-            for i in range(1,NLIGHTS+1): ctl("light%d"%i,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(i,"Light %d"%i)})
+            for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
             ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"})
             ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"})
         else:
