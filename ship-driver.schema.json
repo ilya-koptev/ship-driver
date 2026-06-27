@@ -1304,29 +1304,29 @@
               "title": "Подсветка",
               "propertyOrder": 4,
               "properties": {
-                "light1": {
+                "nav_lights": {
                   "$ref": "#/definitions/pin",
-                  "title": "Light 1",
+                  "title": "Navigation lights",
                   "propertyOrder": 1
                 },
-                "light2": {
+                "morse_lamp": {
                   "$ref": "#/definitions/pin",
-                  "title": "Light 2",
+                  "title": "Morse signal lamp",
                   "propertyOrder": 2
                 },
-                "light3": {
+                "deck_lights": {
                   "$ref": "#/definitions/pin",
-                  "title": "Light 3",
+                  "title": "Deck lights",
                   "propertyOrder": 3
                 },
-                "light4": {
+                "cabin_light1": {
                   "$ref": "#/definitions/pin",
-                  "title": "Ходовые огни",
+                  "title": "Cabin light 1",
                   "propertyOrder": 4
                 },
-                "light5": {
+                "cabin_light2": {
                   "$ref": "#/definitions/pin",
-                  "title": "Внутренняя подсветка",
+                  "title": "Cabin light 2",
                   "propertyOrder": 5
                 }
               },
@@ -1570,29 +1570,29 @@
                 "title": "Подсветка",
                 "propertyOrder": 4,
                 "properties": {
-                  "light1": {
+                  "nav_lights": {
                     "$ref": "#/definitions/pin",
-                    "title": "Light 1",
+                    "title": "Navigation lights",
                     "propertyOrder": 1
                   },
-                  "light2": {
+                  "morse_lamp": {
                     "$ref": "#/definitions/pin",
-                    "title": "Light 2",
+                    "title": "Morse signal lamp",
                     "propertyOrder": 2
                   },
-                  "light3": {
+                  "deck_lights": {
                     "$ref": "#/definitions/pin",
-                    "title": "Light 3",
+                    "title": "Deck lights",
                     "propertyOrder": 3
                   },
-                  "light4": {
+                  "cabin_light1": {
                     "$ref": "#/definitions/pin",
-                    "title": "Ходовые огни",
+                    "title": "Cabin light 1",
                     "propertyOrder": 4
                   },
-                  "light5": {
+                  "cabin_light2": {
                     "$ref": "#/definitions/pin",
-                    "title": "Внутренняя подсветка",
+                    "title": "Cabin light 2",
                     "propertyOrder": 5
                   }
                 },
