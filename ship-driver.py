@@ -145,7 +145,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 LIGHT_TITLE={4:"Ходовые огни",5:"Внутренняя подсветка"}   # dashboard titles (others default to "Light N")
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]
-BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode")]   # shown only while polling (online); removed in SEARCH/OFF
+BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
 def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xFF,param&0xFF,0xEF])
@@ -441,6 +441,7 @@ class Driver:
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
         ctl("enabled",{"type":"switch","readonly":False},1 if ch.enabled else 0)
         ctl("mode",{"type":"text","readonly":True})
+        ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
             for nm,u in (("battery_current","A"),("battery_temperature","°C"),("charge_level","%")):
                 ctl(nm,{"type":"value","readonly":True,"units":u})
@@ -448,7 +449,6 @@ class Driver:
             for i in range(1,NLIGHTS+1): ctl("light%d"%i,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(i,"Light %d"%i)})
             ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX})
             ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX})
-            ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},ch.lora["address"])
         else:
             for c in BOAT_EXTRA:   # remove control: clear its meta, error flag and value
                 for sub in ("/meta","/meta/error",""):
