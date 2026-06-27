@@ -86,8 +86,8 @@ DEFAULTS={
      "air_rate":62.5,"power":22,
      "motors":{"back_left":{"slave":12,"channel":1},"front_left":{"slave":12,"channel":2},
                "back_right":{"slave":11,"channel":1},"front_right":{"slave":11,"channel":2}},
-     "lights":{"light1":{"slave":11,"channel":3},"light2":{"slave":12,"channel":3},"light3":{"slave":13,"channel":2},
-               "light4":{"slave":13,"channel":1},"light5":{"slave":13,"channel":3}}},
+     "lights":{"light1":{"slave":11,"channel":3},"light2":{"slave":12,"channel":3},"light3":{"slave":13,"channel":1},
+               "light4":{"slave":13,"channel":2},"light5":{"slave":13,"channel":3}}},
    "list":[],   # per ship: {"address":N,"channel":C,"motors":{...},"lights":{...}}
  },
 }
@@ -143,7 +143,7 @@ MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
 NLIGHTS=len(DEFAULT_WIRING[2])
 _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
-LIGHT_TITLE={4:"Ходовые огни",5:"Внутренняя подсветка"}   # dashboard titles (others default to "Light N")
+LIGHT_TITLE={1:"Ходовые огни",2:"Прожектор морзе",3:"Палубные огни",4:"Внутренний свет 1",5:"Внутренний свет 2"}   # dashboard titles
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 
@@ -437,6 +437,7 @@ class Driver:
         d=ch.dev; o=[0]
         def ctl(name,meta,val=None):
             o[0]+=1; m=dict(meta,order=o[0])
+            if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
         ctl("enabled",{"type":"switch","readonly":False},1 if ch.enabled else 0)
@@ -465,6 +466,7 @@ class Driver:
         so=[0]
         def sctl(name,meta,val=None):
             so[0]+=1; m=dict(meta,order=so[0])
+            if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(sd,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
         sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},self.setup_number)
