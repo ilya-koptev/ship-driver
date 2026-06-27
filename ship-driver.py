@@ -141,7 +141,7 @@ def wiring_for(addr):
 # control set is the SAME on every ship -> names/count fixed (from default), only the register mapping varies per ship
 MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
 NLIGHTS=len(DEFAULT_WIRING[2])
-_MT={"front_right":"Bow starboard","back_right":"Stern starboard","front_left":"Bow port","back_left":"Stern port"}
+_MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front Left","back_left":"Back Left"}
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 LIGHT_TITLE={1:"Navigation lights",2:"Morse signal lamp",3:"Deck lights",4:"Cabin light 1",5:"Cabin light 2"}   # dashboard titles (nautical, English)
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+["light%d"%i for i in range(1,NLIGHTS+1)]+["mp3_track","mp3_volume","ship_number"]

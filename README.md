@@ -70,7 +70,7 @@
 | `enabled` | зап. | канал вкл/выкл (1/0) |
 | `mode` | чт. | текущий режим |
 | `battery_current` / `battery_temperature` / `charge_level` | чт. | телеметрия ИБП (адрес 10) |
-| `back_left` / `front_left` / `back_right` / `front_right` | зап. | моторы, 40–80 % (40 = холостой) |
+| `back_left` / `front_left` / `back_right` / `front_right` | зап. | моторы (Back Left / Front Left / Back Right / Front Right), 40–80 % (40 = холостой) |
 | `light1 … light5` | зап. | свет, 0–100 % (имена/разводка — см. [«Подключение света»](#подключение-света-uln2003)) |
 | `mp3_track` | зап. | плеер: 0 = стоп, 1–15 = трек |
 | `mp3_volume` | зап. | плеер: громкость 0–30 |
