@@ -406,10 +406,15 @@ class Driver:
             c=mqtt.Client()                               # paho-mqtt 1.x (older Debian / WB7)
         c.on_connect=self.on_connect; c.on_message=self.on_message
         c.connect("localhost",1883,60); self.mqtt=c; c.loop_start()
+    def setname(self,dev,title):
+        # newer WB firmware reads the device title from the /devices/<id>/meta JSON object;
+        # /meta/name is legacy (older WB7). Publish both.
+        self.mqtt.publish("/devices/%s/meta"%dev,json.dumps({"driver":"ship-driver","title":{"en":title,"ru":title}}),retain=True)
+        self.mqtt.publish("/devices/%s/meta/name"%dev,title,retain=True)
     def declare(self):
         for n,ch in self.channels.items():
             d=ch.dev; o=[0]
-            self.mqtt.publish("/devices/%s/meta/name"%d,"boat%s (ch %s)"%(n[-1],ch.lora["channel"]),retain=True)
+            self.setname(d,"boat%s (ch %s)"%(n[-1],ch.lora["channel"]))
             def ctl(name,meta,val=None,d=d,o=o):
                 o[0]+=1; m=dict(meta,order=o[0])
                 self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
@@ -426,7 +431,7 @@ class Driver:
             self.mqtt.subscribe("/devices/%s/controls/+/on"%d)
         # ---- Ship Setup dashboard (RS485-1 wired config) — unchanged ----
         sd="ship_setup"
-        self.mqtt.publish("/devices/%s/meta/name"%sd,"Ship Setup (RS485-1)",retain=True)
+        self.setname(sd,"Ship Setup (RS485-1)")
         so=[0]
         def sctl(name,meta,val=None):
             so[0]+=1; m=dict(meta,order=so[0])
@@ -453,6 +458,7 @@ class Driver:
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
+            self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
             self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
             for cname in BOAT_CONTROLS:
                 self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,cname),"",retain=True)
