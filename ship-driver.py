@@ -119,6 +119,10 @@ REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .
 REG_TAIL=[0x00,0x00]   # regs 0x06,0x07 (CRYPT high/low) — .6 reference; written so the full dump matches
 LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
+GRKCH_CHANNELS={14,16,17,19}   # ГКРЧ-allowed LoRa channels
+def grkch(ch):
+    try: return "✓ ГКРЧ" if int(ch) in GRKCH_CHANNELS else "⚠ вне ГКРЧ"
+    except Exception: return "?"
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
 ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
 def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[(slave,ch)] in light1..N order)
@@ -364,7 +368,8 @@ class Driver:
             en=st.get(n,{}).get("enabled", n in ENABLED_AT_START)
             self.channels[n]=Channel(self,n,tty,g,en)
         self.mqtt=None
-        self.setup_number=int(SETUP_DEFAULTS["address"])   # Ship Setup: only the ship number (= LoRa address) is editable
+        self.setup_number=int(SETUP_DEFAULTS["address"]); self.setup_channel=int(SETUP_DEFAULTS["channel"])   # Ship Setup editable: number + channel
+        self.setup_air=float(SETUP_DEFAULTS["air_rate"]); self.setup_power=int(SETUP_DEFAULTS["power"])        # preserved from last read, used on write
         self.setupq=queue.Queue()
     def load(self):
         try: return json.load(open(STATE_FILE))
@@ -408,10 +413,11 @@ class Driver:
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
         sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Номер корабля"},self.setup_number)
         sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa адрес"},self.setup_number)
-        sctl("LoRa_channel",{"type":"value","readonly":True,"title":"LoRa канал"},"")
-        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},"")
-        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},"")
-        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm"},"")
+        sctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83,"title":"LoRa канал"},self.setup_channel)
+        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz"},round(FREQ_BASE+self.setup_channel,3))
+        sctl("LoRa_grkch",{"type":"text","readonly":True,"title":"ГКРЧ"},grkch(self.setup_channel))
+        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps"},self.setup_air)
+        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm"},self.setup_power)
         sctl("LoRa_lbt",{"type":"text","readonly":True,"title":"LBT"},"")
         sctl("LoRa_read",{"type":"pushbutton","title":"Считать"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Записать"})
         sctl("LoRa_status",{"type":"text","readonly":True})
@@ -440,30 +446,30 @@ class Driver:
             try: self.setup_number=int(float(val))
             except Exception: self.setup_number=0
             sp("ship_number",self.setup_number); sp("LoRa_address",self.setup_number)
-        elif ctrl=="LoRa_read": self.setup_op(None)            # read connected ship's modem, show data
-        elif ctrl=="LoRa_apply": self.setup_op(self.setup_number)  # write: pull this ship's radio from conf, program the modem
-    def setup_op(self,num):   # num=None -> read only; else write ship #num's radio (from conf "ships") to the connected modem
+        elif ctrl=="LoRa_channel":
+            try: self.setup_channel=int(float(val))
+            except Exception: self.setup_channel=0
+            sp("LoRa_channel",self.setup_channel); sp("LoRa_freq",round(FREQ_BASE+self.setup_channel,3)); sp("LoRa_grkch",grkch(self.setup_channel))
+        elif ctrl=="LoRa_read": self.setup_op(False)           # read connected ship modem -> show all params
+        elif ctrl=="LoRa_apply": self.setup_op(True)           # write number+channel (and full dump) to the connected modem
+    def setup_op(self,write):   # write=False -> read connected ship modem; write=True -> program number+channel (full dump) then read back
         st=lambda v: self.mqtt.publish("/devices/ship_setup/controls/LoRa_status",v,retain=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
-        radio=None
-        if num is not None:
-            radio=SHIP_RADIO.get(int(num))
-            if radio is None: st("ERR корабль №%s не настроен в конфиге"%num); return
-        st("запись..." if num is not None else "чтение...")
+        st("запись..." if write else "чтение...")
         try:
             ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
-            if radio is not None:
-                air=AIR_CODE.get(("%g"%radio["air_rate"]),7); pw=PWR_CODE.get(str(int(radio["power"])),0)
-                msg=bytes([0xC0,0x00,0x06,(int(num)>>8)&0xFF,int(num)&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(radio["channel"])&0xFF,REG5_TXMODE])
+            if write:
+                air=AIR_CODE.get(("%g"%self.setup_air),7); pw=PWR_CODE.get(str(int(self.setup_power)),0)
+                msg=bytes([0xC0,0x00,0x08,(self.setup_number>>8)&0xFF,self.setup_number&0xFF,SPED_BASE|air,OPTION_BASE|pw,self.setup_channel&0xFF,REG5_TXMODE,0x00,0x00])
                 ser.reset_input_buffer(); ser.write(msg); ser.flush(); time.sleep(0.5); ser.read(64)
             ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x08])); ser.flush(); time.sleep(0.4); r=ser.read(64)
             ser.close()
             if len(r)>=11 and r[0]==0xC1:
-                c=r[3:11]; addr=(c[0]<<8)|c[1]; air_s=AIR_NAME.get(c[2]&7,"?")
-                sp("ship_number",addr); sp("LoRa_address",addr); sp("LoRa_channel",c[4]); sp("LoRa_air_rate",air_s); sp("LoRa_freq",round(FREQ_BASE+c[4],3))
-                sp("LoRa_power",PWR_NAME.get(c[3]&3,"?")); sp("LoRa_lbt","вкл" if c[5]&0x10 else "выкл")
-                self.setup_number=addr
-                st("OK №%d ch=%d freq=%.3f air=%s power=%s reg5=0x%02x raw=%s"%(addr,c[4],FREQ_BASE+c[4],air_s,PWR_NAME.get(c[3]&3,"?"),c[5],c.hex()))
+                c=r[3:11]; addr=(c[0]<<8)|c[1]; ch=c[4]; air_s=AIR_NAME.get(c[2]&7,"?"); pw_s=PWR_NAME.get(c[3]&3,"?"); lbt="вкл" if c[5]&0x10 else "выкл"
+                self.setup_number=addr; self.setup_channel=ch; self.setup_air=float(air_s); self.setup_power=int(pw_s) if pw_s!="?" else self.setup_power
+                sp("ship_number",addr); sp("LoRa_address",addr); sp("LoRa_channel",ch); sp("LoRa_freq",round(FREQ_BASE+ch,3)); sp("LoRa_grkch",grkch(ch))
+                sp("LoRa_air_rate",air_s); sp("LoRa_power",pw_s); sp("LoRa_lbt",lbt)
+                st("OK №%d ch=%d freq=%.3f %s air=%s power=%s LBT=%s raw=%s"%(addr,ch,FREQ_BASE+ch,grkch(ch),air_s,pw_s,lbt,c.hex()))
             else:
                 st("ERR нет ответа (модем корабля в режиме CONFIG?)")
         except Exception as e: st("ERR %s"%e)
