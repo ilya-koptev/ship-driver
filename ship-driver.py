@@ -261,9 +261,10 @@ class Channel(threading.Thread):
         elif ctrl=="mp3_volume" and self.online:
             is_cmd=False; v=max(0,min(MP3_VOL_MAX,iv)); self.send_mp3(mp3_frame(MP3["vol"],v)); self.pub("mp3_volume",v)
         elif ctrl=="ship_number":
-            is_cmd=False; self.lora["address"]=iv; self.pub(ctrl,iv); self.lora_op(self.lora)  # ship number = LoRa address; write modem immediately (ship switch)
+            # ship number = LoRa address. Persist FIRST (survives reboot even if the slow modem write is interrupted), then write modem.
+            is_cmd=False; self.lora["address"]=iv; self.apply_wiring(); self.pub(ctrl,iv); self.drv.save(); self.lora_op(self.lora)
         else: is_cmd=False
-        if ctrl in ("enabled","ship_number"): self.drv.save()
+        if ctrl=="enabled": self.drv.save()
         if is_cmd: self.last_cmd=time.monotonic()
     def drain(self):
         while True:
@@ -399,7 +400,11 @@ class Driver:
         self.channels={}
         for n,(tty,g) in CHANNELS.items():
             en=st.get(n,{}).get("enabled", n in ENABLED_AT_START)
-            self.channels[n]=Channel(self,n,tty,g,en)
+            ch=Channel(self,n,tty,g,en); self.channels[n]=ch
+            sn=st.get(n,{}).get("ship_number")   # persist last-entered ship number across reboot (written to modem at start)
+            if sn is not None:
+                try: ch.lora["address"]=int(sn); ch.apply_wiring()
+                except Exception: pass
         self.mqtt=None
         self.setup_number=int(SETUP_DEFAULTS["address"]); self.setup_channel=int(SETUP_DEFAULTS["channel"])   # Ship Setup editable: number + channel
         self.setup_air=float(SETUP_DEFAULTS["air_rate"]); self.setup_power=int(SETUP_DEFAULTS["power"])        # preserved from last read, used on write
@@ -408,7 +413,7 @@ class Driver:
         try: return json.load(open(STATE_FILE))
         except Exception: return {}
     def save(self):
-        try: json.dump({n:{"enabled":c.enabled} for n,c in self.channels.items()},open(STATE_FILE,"w"))
+        try: json.dump({n:{"enabled":c.enabled,"ship_number":c.lora["address"]} for n,c in self.channels.items()},open(STATE_FILE,"w"))
         except Exception as e: print("state save err",e,flush=True)
     def setup_mqtt(self):
         try:
