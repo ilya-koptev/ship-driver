@@ -117,7 +117,7 @@ SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_pe
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
 REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
 REG_TAIL=[0x00,0x00]   # regs 0x06,0x07 (CRYPT high/low) — .6 reference; written so the full dump matches
-LORA_DEFAULT_RAW="....6760..03000010"   # .6 reference 9-byte dump (dots=variable addr/channel; 67/60 SPED/OPTION; 03 reg5; 0000 crypt; 10 version)
+LORA_DEFAULT_RAW="xxxx6760xx03000010"   # .6 reference 9-byte dump (x = variable addr/channel; 67/60 SPED/OPTION; 03 reg5; 0000 crypt; 10 version)
 LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
 GRKCH_CHANNELS={14,16,17,19}   # ГКРЧ-allowed LoRa channels
