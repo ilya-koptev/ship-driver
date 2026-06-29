@@ -8,7 +8,7 @@
 
 | № | Компонент | Назначение | Ссылка | Кол‑во |
 |---|---|---|---|---|
-| 1 | **DC‑DC преобразователь** | Питание логики (step‑down, U3) | <a href="https://aliexpress.ru/item/1005009615339570.html" target="_blank" rel="noopener">купить</a> | 1 |
+| 1 | **DC‑DC преобразователь** | Питание логики (step‑down, U3) | <a href="https://aliexpress.ru/item/1005003502071127.html?sku_id=12000026080547853&spm=a2g2w.productlist.search_results.10.32da799eJx07VF">купить</a> | 1 |
 | 2 | **PWM8A04** | 3‑канальный RS485→PWM модуль 5 В, без пинов.(slave 11/12/13) | <a href="https://aliexpress.ru/item/1005004084317682.html" target="_blank" rel="noopener">купить</a> | 3 |
 | 3 | **BLDC‑драйвер** | Драйвер ходовых моторов (U5) | <a href="https://aliexpress.ru/item/1005005372400680.html" target="_blank" rel="noopener">купить</a> | 4 |
 | 4 | **DFPlayer mini** | MP3‑модуль, звук (U$1) | <a href="https://aliexpress.ru/item/1005009007157210.html" target="_blank" rel="noopener">купить</a> | 1 |
