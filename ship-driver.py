@@ -493,20 +493,19 @@ class Driver:
         sctl("LoRa_default",{"type":"text","readonly":True,"title":"LoRa default"},LORA_DEFAULT_RAW)
         sctl("LoRa_read",{"type":"pushbutton","title":"Read"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Write"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
-        # remove dashboards of absent modules (clear retained topics)
+        # remove dashboards of absent modules (clear retained topics, controls-first for live removal)
         for dev in getattr(self,"absent",[]):
-            self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
-            self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
-            for cname in BOAT_CONTROLS:
-                self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,cname),"",retain=True)
-                self.mqtt.publish("/devices/%s/controls/%s"%(dev,cname),"",retain=True)
-    def clear_device(self,dev,controls):   # wipe a device's retained topics so homeui drops the dashboard
-        self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
-        self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
+            self.clear_device(dev,BOAT_CONTROLS)
+    def clear_device(self,dev,controls):   # wipe a device's retained topics so homeui drops the dashboard.
+        # Order matters for live removal (no F5): clear all controls FIRST (homeui removes the cells),
+        # then the device /meta LAST — only then does homeui's cleanup see cells==0 and delete the
+        # device from its observable list. If /meta is cleared while controls remain, it stays until F5.
         for c in controls:
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,c),"",retain=True)
             self.mqtt.publish("/devices/%s/controls/%s/meta/error"%(dev,c),"",retain=True)
             self.mqtt.publish("/devices/%s/controls/%s"%(dev,c),"",retain=True)
+        self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
+        self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
     def shutdown(self,*_):   # on stop (SIGTERM from systemctl): collapse boatN + ship_setup dashboards
         try:
             if self.mqtt is not None:
