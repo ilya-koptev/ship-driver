@@ -8,7 +8,7 @@
 # boatN MQTT device = operational API + visualisation (driven by external software); LoRa config
 # lives in the conf, only LoRa_address is live on boatN (writes the modem immediately, applying the
 # conf channel/air/power + the new address). Wired ship pre-config stays on the "Ship Setup" dashboard.
-import time, threading, queue, json, os, re
+import time, threading, queue, json, os, re, signal
 import serial
 import paho.mqtt.client as mqtt
 
@@ -148,6 +148,7 @@ _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lig
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
+SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
 def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xFF,param&0xFF,0xEF])
@@ -498,6 +499,21 @@ class Driver:
             for cname in BOAT_CONTROLS:
                 self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,cname),"",retain=True)
                 self.mqtt.publish("/devices/%s/controls/%s"%(dev,cname),"",retain=True)
+    def clear_device(self,dev,controls):   # wipe a device's retained topics so homeui drops the dashboard
+        self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
+        self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
+        for c in controls:
+            self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,c),"",retain=True)
+            self.mqtt.publish("/devices/%s/controls/%s/meta/error"%(dev,c),"",retain=True)
+            self.mqtt.publish("/devices/%s/controls/%s"%(dev,c),"",retain=True)
+    def shutdown(self,*_):   # on stop (SIGTERM from systemctl): collapse boatN + ship_setup dashboards
+        try:
+            if self.mqtt is not None:
+                for ch in self.channels.values(): self.clear_device(ch.dev,BOAT_CONTROLS)
+                self.clear_device("ship_setup",SETUP_CONTROLS)
+                time.sleep(0.6)   # let the retained clears flush before we exit
+        except Exception as e: print("shutdown clear err",e,flush=True)
+        os._exit(0)
     def on_connect(self,c,u,f,rc,props=None): self.declare()
     def on_message(self,c,u,msg):
         p=msg.topic.split("/"); dev=p[2]; ctrl=p[4]; val=msg.payload.decode(errors="ignore").strip()
@@ -556,6 +572,7 @@ class Driver:
         self.channels=present   # dashboards only for modules that actually responded (no fallback)
         if not present: print("no MOD modules responded — only Ship Setup will be shown",flush=True)
         self.setup_mqtt(); time.sleep(1.0)
+        signal.signal(signal.SIGTERM,self.shutdown); signal.signal(signal.SIGINT,self.shutdown)   # clear dashboards on stop
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
         while True: time.sleep(1)
