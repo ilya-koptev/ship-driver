@@ -473,13 +473,14 @@ class Driver:
             if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
             self.mqtt.publish("/devices/%s/controls/%s/meta"%(sd,name),json.dumps(m),retain=True)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
-        sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},self.setup_number)
-        sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa address"},self.setup_number)
-        sctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83,"title":"LoRa channel"},self.setup_channel)
-        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz","title":"Frequency"},round(FREQ_BASE+self.setup_channel,3))
-        sctl("LoRa_grkch",{"type":"text","readonly":True,"title":"Band (GKRCh)"},grkch(self.setup_channel))
-        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps","title":"Air rate"},self.setup_air)
-        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm","title":"Power"},self.setup_power)
+        # all fields start empty; filled by "Read" (setup_op) — nothing shown until we read a modem
+        sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},"")
+        sctl("LoRa_address",{"type":"value","readonly":True,"title":"LoRa address"},"")
+        sctl("LoRa_channel",{"type":"value","readonly":False,"min":0,"max":83,"title":"LoRa channel"},"")
+        sctl("LoRa_freq",{"type":"value","readonly":True,"units":"MHz","title":"Frequency"},"")
+        sctl("LoRa_grkch",{"type":"text","readonly":True,"title":"Band (GKRCh)"},"")
+        sctl("LoRa_air_rate",{"type":"value","readonly":True,"units":"kbps","title":"Air rate"},"")
+        sctl("LoRa_power",{"type":"value","readonly":True,"units":"dBm","title":"Power"},"")
         sctl("LoRa_lbt",{"type":"text","readonly":True,"title":"LBT"},"")
         sctl("LoRa_uart",{"type":"text","readonly":True,"title":"UART"},"")
         sctl("LoRa_subpacket",{"type":"value","readonly":True,"units":"bytes","title":"Subpacket"},"")
@@ -545,7 +546,8 @@ class Driver:
         try:
             ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
             if write:
-                air=AIR_CODE.get(("%g"%self.setup_air),7); pw=PWR_CODE.get(str(int(self.setup_power)),0)
+                # write OUR defaults for everything except address+channel (which come from the fields)
+                air=AIR_CODE.get(("%g"%SETUP_DEFAULTS["air_rate"]),7); pw=PWR_CODE.get(str(int(SETUP_DEFAULTS["power"])),0)
                 msg=bytes([0xC0,0x00,0x08,(self.setup_number>>8)&0xFF,self.setup_number&0xFF,SPED_BASE|air,OPTION_BASE|pw,self.setup_channel&0xFF,REG5_TXMODE,0x00,0x00])
                 ser.reset_input_buffer(); ser.write(msg); ser.flush(); time.sleep(0.5); ser.read(64)
             ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x09])); ser.flush(); time.sleep(0.4); r=ser.read(64)
