@@ -167,8 +167,14 @@ MQTT‑устройство `ship_setup` для прошивки LoRa‑моде
 
 ## Временно отдать шину штатному `wb-mqtt-serial` (напр., для настройки УПС)
 
-Драйвер и `wb-mqtt-serial` не работают одновременно (`Conflicts`). Временно — через
-`start`/`stop`, **без** `enable/disable` (после ребута сам вернётся `ship-driver`):
+**Проще всего — переключателем на дашборде.** Пакет ставит правило wb-rules
+(`/etc/wb-rules/ship-bus-switch.js`) с виртуальным устройством **«Драйвер шины корабля»**
+(`ship_bus`): переключатель `ship_driver` (вкл = `ship-driver`, выкл = `wb-mqtt-serial`) и
+индикатор активного сервиса. Логика идемпотентна — перезагрузка движка wb-rules сервисы не дёргает.
+
+Либо вручную через `systemctl`. Драйвер и `wb-mqtt-serial` не работают одновременно
+(`Conflicts`). Временно — через `start`/`stop`, **без** `enable/disable` (после ребута сам
+вернётся `ship-driver`):
 
 ```sh
 systemctl stop  ship-driver  && systemctl start wb-mqtt-serial   # отдать serial
