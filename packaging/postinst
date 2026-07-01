@@ -8,4 +8,6 @@ systemctl enable ship-driver.service || true
 systemctl restart ship-driver.service || true
 # let wb-mqtt-confed pick up the settings schema (web config editor)
 systemctl try-restart wb-mqtt-confed.service || true
+# reload wb-rules so the ship bus switch (virtual device) appears
+systemctl try-restart wb-rules.service || true
 exit 0
