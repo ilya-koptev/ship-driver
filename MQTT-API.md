@@ -189,27 +189,3 @@ TX → 7E FF 06 08 00 00 03 EF
 |---|---|---|---|---|
 | `FREQ_REG` | 0 | 1 | 2 | Частота ШИМ |
 | `DUTY_REG` | 112 | 113 | 114 | Скважность (duty) |
-
----
-
-## ship_setup — преднастройка модема по проводу
-
-Устройство для прошивки LoRa-модема корабля через `/dev/ttyRS485-1` (модем в режиме CONFIG).
-
-```bash
-# подписаться на все параметры
-mosquitto_sub -h 192.168.69.105 -t '/devices/ship_setup/controls/+' -v
-
-# Read — считать регистры подключённого модема
-mosquitto_pub -h 192.168.69.105 -t '/devices/ship_setup/controls/LoRa_read/on' -m 1
-
-# задать номер корабля и канал
-mosquitto_pub -h 192.168.69.105 -t '/devices/ship_setup/controls/ship_number/on' -m 9
-mosquitto_pub -h 192.168.69.105 -t '/devices/ship_setup/controls/LoRa_channel/on' -m 14
-
-# Write — записать конфиг в модем
-mosquitto_pub -h 192.168.69.105 -t '/devices/ship_setup/controls/LoRa_apply/on' -m 1
-```
-
-Разрешённые каналы ГКРЧ: CH14 (864.125), CH16 (866.125), CH17 (867.125), CH19 (869.125 МГц).  
-Результат Read/Write: `journalctl -u ship-driver -f`.
