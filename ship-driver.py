@@ -8,7 +8,7 @@
 # boatN MQTT device = operational API + visualisation (driven by external software); LoRa config
 # lives in the conf, only LoRa_address is live on boatN (writes the modem immediately, applying the
 # conf channel/air/power + the new address). Wired ship pre-config stays on the "Ship Setup" dashboard.
-import time, threading, queue, json, os, re, signal
+import time, threading, queue, json, os, re, signal, socket
 import serial
 import paho.mqtt.client as mqtt
 
@@ -56,7 +56,7 @@ CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
 
 PWM_SLAVES=[11,12,13]; FREQ_REG={1:0,2:1,3:2}; DUTY_REG={1:112,2:113,3:114}
 ALL_CH=[(s,c) for s in PWM_SLAVES for c in (1,2,3)]
-UPS=10; UPS_CUR=5; UPS_CHG=8; UPS_TEMP=9; UPS_CHG_SETPOINT=18
+UPS=10; UPS_VIN=2; UPS_CUR=5; UPS_CHG=8; UPS_TEMP=9; UPS_CHG_SETPOINT=18   # UPS_VIN=2: input voltage (x0.001)
 # motor/light -> (pwm slave, channel) wiring is loaded from the conf "wiring" section below
 
 SEARCH="SEARCH"; SAIL="SAILING"; CHARGE="CHARGING"; IDLE="IDLE"; SERVICE="SERVICE"; OFF="OFF"
@@ -90,6 +90,11 @@ DEFAULTS={
                "cabin_light1":{"slave":13,"channel":2},"cabin_light2":{"slave":13,"channel":3}}},
    "list":[],   # per ship: {"address":N,"channel":C,"motors":{...},"lights":{...}}
  },
+ "chargers":[   # wireless charging stations on Modbus-RTU-over-TCP gateways. relay = XKT-801 transmitter + hold magnets (separate channels); MAI = tx current (voltage drop on a shunt). Each charger has its own "gateway".
+   {"gateway":"192.168.69.33:8886",
+    "transmitter":{"address":87,"channel":2,"invert":True},   # WB-MRM2-mini K2 -> XKT-801 (NC relay: coil 0 = ON, so invert)
+    "magnets":{"address":87,"channel":1,"invert":True},       # WB-MRM2-mini K1 -> hold magnets (NC: invert)
+    "sensor":{"address":3,"input":1,"shunt_ohm":1.2}}],        # WB-MAI6 IN1, I = V / shunt
 }
 def deep_merge(base,over):
     for k,v in (over or {}).items():
@@ -138,6 +143,13 @@ SHIP_RADIO={int(s["address"]):{"channel":s["channel"],"air_rate":DEFAULT_AIR_RAT
 def wiring_for(addr):
     try: return SHIP_WIRING.get(int(addr),DEFAULT_WIRING)
     except Exception: return DEFAULT_WIRING
+# ---- charging stations (Modbus-RTU-over-TCP via a serial-gateway) ----
+CHG_LIST=C.get("chargers",[])
+CHG_PERIOD=3.0            # charger bus poll period, s
+MAI_VOLT_SCALE=1e-6       # WB-MAI6 input-voltage raw (s32) -> volts
+MAI_IN0=0x0700           # WB-MAI6 fw2.4: IN n voltage input reg = MAI_IN0 + 2*(n-1), s32
+MRM_COIL0=0; MRM_STATE0=96   # WB-MRM2-mini: K ch -> coil (ch-1); real contact state -> discrete 96+(ch-1)
+CHARGER_CONTROLS=["transmitter","magnets","transmitter_current"]
 # control set is the SAME on every ship -> names/count fixed (from default), only the register mapping varies per ship
 MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
 LIGHT_NAMES=[n for n,_,_ in DEFAULT_WIRING[2]]
@@ -146,7 +158,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","input_voltage"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -183,6 +195,7 @@ def crc16(d):
         for _ in range(8): c=(c>>1)^0xA001 if c&1 else c>>1
     return bytes([c&0xFF,(c>>8)&0xFF])
 def s16(v): return v-65536 if v>=32768 else v
+def s32(hi,lo): v=(hi<<16)|lo; return v-0x100000000 if v>=0x80000000 else v
 def gpio_set(n,v):
     if n is None: return
     base="/sys/class/gpio/gpio%d"%n
@@ -319,9 +332,11 @@ class Channel(threading.Thread):
         for n,s,c in self.motors: self.pub(n,self.motor[n])
         for n,s,c in self.lights: self.pub(n,self.light[n])
     def poll_current(self):
-        r=self.read_regs(UPS,4,UPS_CUR,1)
-        if r is None: self.puberr("battery_current","r"); return False
-        self.tele["current"]=s16(r[0])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current",""); return True
+        r=self.read_regs(UPS,4,UPS_VIN,4)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat (input voltage rides along at the 5 s current rate)
+        if r is None: self.puberr("battery_current","r"); self.puberr("input_voltage","r"); return False
+        self.tele["current"]=s16(r[3])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current","")
+        self.pub("input_voltage",round(r[0]*0.001,2)); self.puberr("input_voltage","")
+        return True
     def pwm_alive(self):   # ship reachable via pwm even when UPS is off — probe each pwm8a04 frequency register
         for s in PWM_SLAVES:
             if self.read_regs(s,3,FREQ_REG[1],1) is not None: return True
@@ -400,6 +415,126 @@ class Channel(threading.Thread):
             if self.mode==CHARGE: self.thermal()
             if not did: time.sleep(0.2)
 
+class ModbusTCP:
+    # Modbus-RTU framed over a transparent TCP serial-gateway (e.g. EBYTE): same RTU frames + CRC16, sent over a socket.
+    def __init__(self,host,port,timeout=1.0):
+        self.host=host; self.port=int(port); self.timeout=timeout; self.sock=None; self.lock=threading.Lock()
+    def connect(self):
+        if self.sock is None:
+            self.sock=socket.create_connection((self.host,self.port),self.timeout); self.sock.settimeout(self.timeout)
+    def close(self):
+        if self.sock is not None:
+            try: self.sock.close()
+            except Exception: pass
+            self.sock=None
+    def _drain(self):   # discard any stale bytes buffered by the gateway before a new transaction
+        try:
+            self.sock.setblocking(False)
+            while self.sock.recv(512): pass
+        except Exception: pass
+        finally:
+            try: self.sock.setblocking(True); self.sock.settimeout(self.timeout)
+            except Exception: pass
+    def _txn(self,req,n):
+        with self.lock:
+            self.connect(); self._drain()
+            try: self.sock.sendall(req)
+            except Exception: self.close(); raise
+            end=time.monotonic()+self.timeout; buf=b""
+            while len(buf)<n and time.monotonic()<end:
+                try: c=self.sock.recv(n-len(buf))
+                except socket.timeout: break
+                except Exception: self.close(); raise
+                if not c: self.close(); break
+                buf+=c
+            return buf
+    def read_input(self,slave,addr,n):   # func 4 -> list of n 16-bit regs
+        req=bytes([slave,4,(addr>>8)&0xFF,addr&0xFF,(n>>8)&0xFF,n&0xFF]); req+=crc16(req)
+        r=self._txn(req,5+2*n)
+        if len(r)>=5+2*n and r[0]==slave and r[1]==4 and r[2]==2*n and crc16(r[:3+2*n])==r[3+2*n:5+2*n]:
+            return [(r[3+2*i]<<8)|r[4+2*i] for i in range(n)]
+        return None
+    def read_discrete(self,slave,addr,n):   # func 2 -> list of n bits
+        nb=(n+7)//8; req=bytes([slave,2,(addr>>8)&0xFF,addr&0xFF,(n>>8)&0xFF,n&0xFF]); req+=crc16(req)
+        r=self._txn(req,5+nb)
+        if len(r)>=5+nb and r[0]==slave and r[1]==2 and crc16(r[:3+nb])==r[3+nb:5+nb]:
+            return [(r[3+(i//8)]>>(i%8))&1 for i in range(n)]
+        return None
+    def write_coil(self,slave,addr,on):   # func 5
+        req=bytes([slave,5,(addr>>8)&0xFF,addr&0xFF,0xFF if on else 0x00,0x00]); req+=crc16(req)
+        r=self._txn(req,8); return len(r)>=8 and r[0]==slave and r[1]==5
+
+class ChargerBus(threading.Thread):
+    # Single thread; one ModbusTCP per DISTINCT gateway (each charger may have its own gateway; chargers that
+    # share a gateway share one socket+lock). Coils are written with our own RTU frames, so at start we only
+    # REFLECT the real relay state, never toggle it.
+    def __init__(self,drv,chargers):
+        super().__init__(daemon=True)
+        self.drv=drv; self.chargers=chargers; self.q=queue.Queue()
+        self.buses={}   # gateway str -> ModbusTCP
+    def dev(self,i): return "charger%d"%(i+1)
+    def bus_for(self,ch):
+        g=ch.get("gateway")
+        if not g: return None
+        b=self.buses.get(g)
+        if b is None:
+            host,_,port=g.partition(":"); b=ModbusTCP(host or "127.0.0.1", port or 8886); self.buses[g]=b
+        return b
+    def pub(self,dev,ctrl,val):
+        if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s"%(dev,ctrl),str(val),retain=True)
+    def puberr(self,dev,ctrl,err):
+        if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(dev,ctrl),err,retain=True)
+    def relay_set(self,ch,out,on):
+        bus=self.bus_for(ch)
+        if bus is None: return False
+        v=(not on) if out.get("invert") else on
+        return bus.write_coil(int(out["address"]),MRM_COIL0+(int(out["channel"])-1),bool(v))
+    def relay_state(self,ch,out):
+        bus=self.bus_for(ch)
+        if bus is None: return None
+        r=bus.read_discrete(int(out["address"]),MRM_STATE0+(int(out["channel"])-1),1)
+        if r is None: return None
+        st=bool(r[0]); return (not st) if out.get("invert") else st
+    def read_current(self,ch):   # WB-MAI6 input voltage (s32) / shunt -> amps
+        bus=self.bus_for(ch)
+        if bus is None: return None
+        s=ch["sensor"]; reg=MAI_IN0+2*(int(s.get("input",1))-1)
+        r=bus.read_input(int(s["address"]),reg,2)
+        if r is None: return None
+        return s32(r[0],r[1])*MAI_VOLT_SCALE/float(s.get("shunt_ohm",1.2))
+    def handle(self,dev,ctrl,val):
+        on=(val in ("1","true","on"))
+        for i,ch in enumerate(self.chargers):
+            if self.dev(i)!=dev: continue
+            out=ch.get(ctrl) if ctrl in ("transmitter","magnets") else None
+            if out is None: return
+            ok=self.relay_set(ch,out,on); self.pub(dev,ctrl,1 if on else 0)
+            print("[%s] %s -> %s (%s)"%(dev,ctrl,on,"ok" if ok else "FAIL"),flush=True); return
+    def run(self):
+        while True:
+            while True:
+                try: dev,ctrl,val=self.q.get_nowait()
+                except queue.Empty: break
+                try: self.handle(dev,ctrl,val)
+                except Exception as e: print("[chg] cmd err %s %s"%(ctrl,e),flush=True)
+            for i,ch in enumerate(self.chargers):
+                dev=self.dev(i)
+                try:
+                    cur=self.read_current(ch)
+                    if cur is None: self.puberr(dev,"transmitter_current","r")
+                    else: self.pub(dev,"transmitter_current",round(cur,3)); self.puberr(dev,"transmitter_current","")
+                    for ctrl in ("transmitter","magnets"):
+                        out=ch.get(ctrl)
+                        if not out: continue
+                        st=self.relay_state(ch,out)
+                        if st is None: self.puberr(dev,ctrl,"r")
+                        else: self.pub(dev,ctrl,1 if st else 0); self.puberr(dev,ctrl,"")
+                except Exception as e:
+                    print("[chg] poll err %s %s"%(dev,e),flush=True)
+                    b=self.bus_for(ch)
+                    if b is not None: b.close()
+            time.sleep(CHG_PERIOD)
+
 class Driver:
     def __init__(self):
         st=self.load()
@@ -415,6 +550,7 @@ class Driver:
         self.setup_number=int(SETUP_DEFAULTS["address"]); self.setup_channel=int(SETUP_DEFAULTS["channel"])   # Ship Setup editable: number + channel
         self.setup_air=float(SETUP_DEFAULTS["air_rate"]); self.setup_power=int(SETUP_DEFAULTS["power"])        # preserved from last read, used on write
         self.setupq=queue.Queue()
+        self.chargerbus=ChargerBus(self,[dict(c) for c in CHG_LIST]) if CHG_LIST else None
     def load(self):
         try: return json.load(open(STATE_FILE))
         except Exception: return {}
@@ -448,7 +584,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("input_voltage","V","Input voltage")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
@@ -493,6 +629,20 @@ class Driver:
         sctl("LoRa_default",{"type":"text","readonly":True,"title":"LoRa default"},LORA_DEFAULT_RAW)
         sctl("LoRa_read",{"type":"pushbutton","title":"Read"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Write"})
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
+        # ---- charging stations (chargerN dashboards) ----
+        if self.chargerbus is not None:
+            for i,ch in enumerate(self.chargerbus.chargers):
+                cd=self.chargerbus.dev(i); co=[0]
+                self.setname(cd,ch.get("name") or "Charger %d"%(i+1))
+                def cctl(name,meta,val=None,_d=cd,_o=co):
+                    _o[0]+=1; m=dict(meta,order=_o[0])
+                    if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}
+                    self.mqtt.publish("/devices/%s/controls/%s/meta"%(_d,name),json.dumps(m),retain=True)
+                    if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(_d,name),str(val),retain=True)
+                cctl("transmitter",{"type":"switch","readonly":False,"title":"Transmitter"})
+                cctl("magnets",{"type":"switch","readonly":False,"title":"Hold magnets"})
+                cctl("transmitter_current",{"type":"value","readonly":True,"units":"A","title":"Transmitter current"})
+                self.mqtt.subscribe("/devices/%s/controls/+/on"%cd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
             self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
@@ -512,6 +662,8 @@ class Driver:
             if self.mqtt is not None:
                 for ch in self.channels.values(): self.clear_device(ch.dev,BOAT_CONTROLS)
                 self.clear_device("ship_setup",SETUP_CONTROLS)
+                if self.chargerbus is not None:
+                    for i in range(len(self.chargerbus.chargers)): self.clear_device(self.chargerbus.dev(i),CHARGER_CONTROLS)
                 time.sleep(0.6)   # let the retained clears flush before we exit
         except Exception as e: print("shutdown clear err",e,flush=True)
         os._exit(0)
@@ -519,6 +671,7 @@ class Driver:
     def on_message(self,c,u,msg):
         p=msg.topic.split("/"); dev=p[2]; ctrl=p[4]; val=msg.payload.decode(errors="ignore").strip()
         if dev=="ship_setup": self.setupq.put((ctrl,val)); return
+        if dev.startswith("charger") and self.chargerbus is not None: self.chargerbus.q.put((dev,ctrl,val)); return
         for ch in self.channels.values():
             if ch.dev==dev: ch.q.put((ctrl,val)); return
     # ---- Ship Setup (RS485-1) handlers ----
@@ -577,6 +730,7 @@ class Driver:
         signal.signal(signal.SIGTERM,self.shutdown); signal.signal(signal.SIGINT,self.shutdown)   # clear dashboards on stop
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
+        if self.chargerbus is not None: self.chargerbus.start(); print("charger bus: %d station(s)"%len(self.chargerbus.chargers),flush=True)
         while True: time.sleep(1)
 
 if __name__=="__main__": Driver().start()

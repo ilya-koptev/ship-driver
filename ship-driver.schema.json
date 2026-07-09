@@ -91,6 +91,40 @@
       "options": {
         "collapsed": true
       }
+    },
+    "relayout": {
+      "type": "object",
+      "title": "Выход реле",
+      "_format": "grid",
+      "properties": {
+        "address": {
+          "type": "integer",
+          "title": "Modbus адрес реле",
+          "minimum": 1,
+          "maximum": 247,
+          "propertyOrder": 1
+        },
+        "channel": {
+          "type": "integer",
+          "title": "Канал K",
+          "minimum": 1,
+          "maximum": 16,
+          "propertyOrder": 2
+        },
+        "invert": {
+          "type": "boolean",
+          "title": "Инверсия",
+          "_format": "checkbox",
+          "propertyOrder": 3
+        }
+      },
+      "required": [
+        "address",
+        "channel"
+      ],
+      "options": {
+        "collapsed": true
+      }
     }
   },
   "properties": {
@@ -316,7 +350,7 @@
     },
     "lora": {
       "type": "object",
-      "title": "LoRa — каналы MOD1-4",
+      "title": "Радио",
       "propertyOrder": 2,
       "options": {
         "collapsed": true
@@ -1617,6 +1651,72 @@
         }
       },
       "title": "Корабли",
+      "options": {
+        "collapsed": true
+      }
+    },
+    "chargers": {
+      "type": "array",
+      "title": "Зарядки",
+      "propertyOrder": 4,
+      "items": {
+            "type": "object",
+            "title": "Зарядка",
+            "headerTemplate": "Charger {{i1}}",
+            "properties": {
+              "gateway": {
+                "type": "string",
+                "title": "Шлюз Modbus-TCP (host:port)",
+                "propertyOrder": 1
+              },
+              "transmitter": {
+                "$ref": "#/definitions/relayout",
+                "title": "Передатчик (реле)",
+                "propertyOrder": 2
+              },
+              "magnets": {
+                "$ref": "#/definitions/relayout",
+                "title": "Магниты фиксации (реле)",
+                "propertyOrder": 3
+              },
+              "sensor": {
+                "type": "object",
+                "title": "Датчик тока (WB-MAI6)",
+                "_format": "grid",
+                "propertyOrder": 4,
+                "properties": {
+                  "address": {
+                    "type": "integer",
+                    "title": "Modbus адрес",
+                    "minimum": 1,
+                    "maximum": 247,
+                    "propertyOrder": 1
+                  },
+                  "input": {
+                    "type": "integer",
+                    "title": "Вход IN",
+                    "enum": [1, 2, 3, 4, 5, 6],
+                    "propertyOrder": 2
+                  },
+                  "shunt_ohm": {
+                    "type": "number",
+                    "title": "Шунт, Ом",
+                    "minimum": 0.001,
+                    "default": 1.2,
+                    "propertyOrder": 3
+                  }
+                },
+                "required": ["address", "input", "shunt_ohm"],
+                "options": {
+                  "collapsed": true
+                }
+              }
+            },
+            "required": ["transmitter", "sensor"],
+            "options": {
+              "collapsed": true
+            }
+          },
       "options": {
         "collapsed": true
       }
