@@ -277,7 +277,11 @@ class Channel(threading.Thread):
             is_cmd=False; v=max(0,min(MP3_VOL_MAX,iv)); self.send_mp3(mp3_frame(MP3["vol"],v)); self.pub("mp3_volume",v)
         elif ctrl=="ship_number":
             # ship number = LoRa address. Persist FIRST (survives reboot even if the slow modem write is interrupted), then write modem.
-            is_cmd=False; self.lora["address"]=iv; self.apply_wiring(); self.pub(ctrl,iv); self.drv.save(); self.lora_op(self.lora)
+            is_cmd=False; changed=(iv!=self.lora["address"])
+            self.lora["address"]=iv; self.apply_wiring(); self.pub(ctrl,iv); self.drv.save(); self.lora_op(self.lora)
+            if changed:   # switched to a DIFFERENT boat -> re-detect so init_ship (freq=400 + idle, which arms the motor ESCs) runs for it
+                self.online=False; self.fails=0; self.due={}
+                print("[%s] ship_number -> %d: forcing re-init (SEARCH) for the new boat"%(self.name,iv),flush=True)
         else: is_cmd=False
         if ctrl=="enabled": self.drv.save()
         if is_cmd: self.last_cmd=time.monotonic()
@@ -325,6 +329,7 @@ class Channel(threading.Thread):
 
     # ---- ship logic ----
     def init_ship(self):
+        print("[%s] init_ship ship=%d: freq=%d, motors->idle(%d), lights->%d"%(self.name,self.lora["address"],INIT_FREQ,INIT_MOTOR,INIT_LIGHT),flush=True)
         for s,c in ALL_CH: self.write_reg(s,DUTY_REG[c],0)          # 1) power (duty) off on every channel first
         for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],INIT_FREQ)  # 2) then pwm frequency = 400
         for n,s,c in self.motors: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)  # 3) then motors to idle (40)
