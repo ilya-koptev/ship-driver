@@ -69,9 +69,9 @@ DEFAULTS={
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
  "rates":{
-   "CHARGING":{"current":5,"temp":10,"charge":60,"motors":60,"lights":60},
-   "SAILING": {"current":5,"temp":300,"charge":300,"motors":60,"lights":60},
-   "IDLE":    {"current":5,"temp":300,"charge":300,"motors":300,"lights":300},
+   "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":90},
+   "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":90},
+   "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":120},
    "sail_timeout_s":30.0, "offline_fails":2,
    "search_period":0.05, "service_period":1.0},
  "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
@@ -354,21 +354,27 @@ class Channel(threading.Thread):
         r=self.read_regs(UPS,4,UPS_CHG,1)
         if r is None: self.puberr("charge_level","r"); return False
         self.pub("charge_level",round(r[0]*0.01,1)); self.puberr("charge_level",""); return True
-    def poll_motors(self):
-        ok=True
-        for n,s,c in self.motors:
-            r=self.read_regs(s,3,DUTY_REG[c],1)
+    def poll_pwm_readback(self):
+        # read-back of all motors+lights via ONE block per pwm8a04 (regs 112..114 = ch1/2/3), then distribute
+        ok=True; block={}
+        for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
+            block[s]=self.read_regs(s,3,DUTY_REG[1],3)   # DUTY_REG[1]=112 -> [ch1,ch2,ch3]
+        for n,s,c in self.motors+self.lights:
+            r=block.get(s)
             if r is None: ok=False; self.puberr(n,"r")
-            else: self.pub(n,r[0]); self.puberr(n,"")
+            else: self.pub(n,r[c-1]); self.puberr(n,"")
         return ok
-    def poll_lights(self):
-        ok=True
-        for n,s,c in self.lights:
-            r=self.read_regs(s,3,DUTY_REG[c],1)
-            if r is None: ok=False; self.puberr(n,"r")
-            else: self.pub(n,r[0]); self.puberr(n,"")
-        return ok
-    GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","motors":"poll_motors","lights":"poll_lights"}
+    def poll_freq_check(self):
+        # guard against pwm freq reverting to default: read freq block (regs 0..2) per slave, re-set INIT_FREQ + log on drift
+        for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
+            r=self.read_regs(s,3,FREQ_REG[1],3)   # FREQ_REG[1]=0 -> [ch1,ch2,ch3]
+            if r is None: continue
+            for i,f in enumerate(r):
+                if f!=INIT_FREQ:
+                    self.write_reg(s,FREQ_REG[i+1],INIT_FREQ)
+                    print("[%s] pwm addr %d ch%d freq drift %d->%d, re-set"%(self.name,s,i+1,f,INIT_FREQ),flush=True)
+        return True
+    GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check"}
     def thermal(self):
         t=self.tele.get("temp")
         if t is None: return

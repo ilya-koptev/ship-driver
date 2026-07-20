@@ -68,15 +68,15 @@
           "minimum": 1,
           "propertyOrder": 3
         },
-        "motors": {
+        "pwm_readback": {
           "type": "integer",
-          "title": "Моторы",
+          "title": "Моторы+свет (сверка)",
           "minimum": 1,
           "propertyOrder": 4
         },
-        "lights": {
+        "freq_check": {
           "type": "integer",
-          "title": "Подсветка",
+          "title": "Проверка частоты ШИМ",
           "minimum": 1,
           "propertyOrder": 5
         }
@@ -85,8 +85,8 @@
         "current",
         "temp",
         "charge",
-        "motors",
-        "lights"
+        "pwm_readback",
+        "freq_check"
       ],
       "options": {
         "collapsed": true
