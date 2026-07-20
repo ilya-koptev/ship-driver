@@ -69,9 +69,9 @@ DEFAULTS={
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
  "rates":{
-   "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":90},
-   "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":90},
-   "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":120},
+   "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10},
+   "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10},
+   "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":10},
    "sail_timeout_s":30.0, "offline_fails":2,
    "search_period":0.05, "service_period":1.0},
  "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},

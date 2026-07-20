@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+# ship-collect-logs <ship|all> <hours>
+# Собирает диагностику корабля в /var/www/ship-logs-<...>.tar.gz (скачивается из браузера).
+# Кладёт: журнал ship-driver, телеметрию бортов из wb-mqtt-db (CSV), конфиг/состояние/версию,
+# снимок текущих значений из MQTT. Печатает путь к архиву последней строкой (его забирает wb-rules).
+import sys, os, json, time, sqlite3, subprocess, tempfile, tarfile, datetime, glob, shutil
+
+SHIP  = (sys.argv[1] if len(sys.argv) > 1 else "all").strip()
+try: HOURS = max(0.1, float(sys.argv[2])) if len(sys.argv) > 2 else 6.0
+except ValueError: HOURS = 6.0
+
+DB    = "/var/lib/wirenboard/db/data.db"
+CONF  = "/etc/ship-driver.conf"
+STATE = "/etc/ship-driver-state.json"
+OUTDIR = "/var/www"
+KEEP  = 10                       # хранить последние N архивов
+now   = time.time()
+since_ms = int((now - HOURS * 3600) * 1000)
+stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+tag   = "all" if SHIP == "all" else "ship%s" % SHIP
+name  = "ship-logs-%s-%s" % (tag, stamp)
+work  = tempfile.mkdtemp(prefix="shiplog-")
+d     = os.path.join(work, name); os.makedirs(d)
+
+def sh(cmd, to=60):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=to).stdout
+    except Exception as e:
+        return "ERR: %s\n" % e
+
+def fmt(ts):
+    t = ts / 1000.0 if ts > 1e12 else ts
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+# 1) журнал драйвера за период (+ немного запаса)
+open(os.path.join(d, "ship-driver.journal.log"), "w").write(
+    sh("journalctl -u ship-driver --since @%d -o short-iso --no-pager" % int(now - HOURS*3600 - 60)))
+
+# 2) какие каналы boatN и их текущий ship_number
+chan_ship = {}
+for n in range(1, 5):
+    v = sh("timeout 2 mosquitto_sub -h 127.0.0.1 -t /devices/boat%d/controls/ship_number -C 1 2>/dev/null" % n, to=4).strip()
+    if v != "":
+        chan_ship[n] = v
+if SHIP == "all":
+    boats = sorted(chan_ship.keys())
+    note = ""
+else:
+    boats = [n for n, s in chan_ship.items() if s == SHIP]
+    note = ""
+    if not boats:                       # корабль сейчас не на связи ни на одном канале
+        boats = sorted(chan_ship.keys())
+        note = "корабль %s сейчас не назначен ни на один канал — собрано по всем\n" % SHIP
+open(os.path.join(d, "boats.txt"), "w").write(
+    "выбран корабль: %s\nпериод, ч: %g\nканал->ship_number: %s\nсобрано с каналов: %s\n%s" %
+    (SHIP, HOURS, chan_ship, boats, note))
+
+# 3) телеметрия из wb-mqtt-db (CSV на канал)
+if os.path.exists(DB):
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True, timeout=8); c = con.cursor()
+        for n in boats:
+            dev = "boat%d" % n
+            chs = c.execute("SELECT int_id,control FROM channels WHERE device=?", (dev,)).fetchall()
+            rows = []
+            for cid, ctrl in chs:
+                for ts, val in c.execute("SELECT timestamp,value FROM data WHERE channel=? AND timestamp>=? ORDER BY timestamp",
+                                         (cid, since_ms)):
+                    rows.append((ts, ctrl, val))
+            rows.sort()
+            with open(os.path.join(d, "%s.telemetry.csv" % dev), "w") as f:
+                f.write("time_utc,control,value\n")
+                for ts, ctrl, val in rows:
+                    f.write("%s,%s,%s\n" % (fmt(ts), ctrl, val))
+        con.close()
+    except Exception as e:
+        open(os.path.join(d, "telemetry.ERROR.txt"), "w").write(str(e))
+else:
+    open(os.path.join(d, "telemetry.ERROR.txt"), "w").write("wb-mqtt-db не найден: %s" % DB)
+
+# 4) конфиг / состояние / версия / снимок MQTT
+for p in (CONF, STATE):
+    if os.path.exists(p):
+        try: shutil.copy(p, os.path.join(d, os.path.basename(p)))
+        except Exception: pass
+open(os.path.join(d, "version.txt"), "w").write(
+    sh("dpkg-query -W -f='${Package} ${Version}\\n' ship-driver 2>/dev/null"))
+snaps = []
+for n in boats:
+    snaps.append("== boat%d ==\n%s" % (n,
+        sh("timeout 3 mosquitto_sub -h 127.0.0.1 -t '/devices/boat%d/controls/+' -v 2>/dev/null" % n, to=5)))
+open(os.path.join(d, "live-snapshot.txt"), "w").write("\n".join(snaps))
+
+# 5) упаковка
+try: os.makedirs(OUTDIR, exist_ok=True)
+except Exception: pass
+out = os.path.join(OUTDIR, name + ".tar.gz")
+with tarfile.open(out, "w:gz") as tf:
+    tf.add(d, arcname=name)
+try: os.chmod(out, 0o644)
+except Exception: pass
+shutil.rmtree(work, ignore_errors=True)
+# ротация старых
+for o in sorted(glob.glob(os.path.join(OUTDIR, "ship-logs-*.tar.gz")))[:-KEEP]:
+    try: os.remove(o)
+    except Exception: pass
+
+print(out)   # ПОСЛЕДНЯЯ строка — путь к архиву (забирает wb-rules для ссылки)
