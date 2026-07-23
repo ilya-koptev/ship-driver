@@ -587,6 +587,19 @@ class Driver:
         # /meta/name is legacy (older WB7). Publish both.
         self.mqtt.publish("/devices/%s/meta"%dev,json.dumps({"driver":"ship-driver","title":{"en":title,"ru":title}}),retain=True)
         self.mqtt.publish("/devices/%s/meta/name"%dev,title,retain=True)
+    def pub_ctrl_meta(self,dev,name,m):
+        # homeui Devices page reads the JSON /meta; homeui DASHBOARD cells resolve only via the
+        # legacy per-field topics (/meta/type, /meta/order, ...). Publish both for full compatibility.
+        base="/devices/%s/controls/%s/meta"%(dev,name)
+        self.mqtt.publish(base,json.dumps(m),retain=True)
+        self.mqtt.publish(base+"/type",str(m.get("type","text")),retain=True)
+        self.mqtt.publish(base+"/order",str(m.get("order",1)),retain=True)
+        self.mqtt.publish(base+"/readonly","1" if m.get("readonly") else "0",retain=True)
+        for k in ("min","max","units","precision"):
+            if m.get(k) is not None: self.mqtt.publish(base+"/"+k,str(m[k]),retain=True)
+    def clear_ctrl(self,dev,name):   # wipe a control incl. legacy meta subtopics
+        for sub in ("/meta","/meta/type","/meta/order","/meta/readonly","/meta/min","/meta/max","/meta/units","/meta/precision","/meta/error",""):
+            self.mqtt.publish("/devices/%s/controls/%s%s"%(dev,name,sub),"",retain=True)
     def boat_controls(self,ch,full):
         # full=True: publish the whole dashboard; full=False: keep only enabled+mode, remove the rest
         # (the "extra" controls are telemetry/commands that only make sense while the channel polls a live ship).
@@ -595,7 +608,7 @@ class Driver:
         def ctl(name,meta,val=None):
             o[0]+=1; m=dict(meta,order=o[0])
             if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
-            self.mqtt.publish("/devices/%s/controls/%s/meta"%(d,name),json.dumps(m),retain=True)
+            self.pub_ctrl_meta(d,name,m)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
         ctl("enabled",{"type":"switch","readonly":False,"title":"Enabled"},1 if ch.enabled else 0)
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
@@ -608,9 +621,7 @@ class Driver:
             ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"})
             ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"})
         else:
-            for c in BOAT_EXTRA:   # remove control: clear its meta, error flag and value
-                for sub in ("/meta","/meta/error",""):
-                    self.mqtt.publish("/devices/%s/controls/%s%s"%(d,c,sub),"",retain=True)
+            for c in BOAT_EXTRA: self.clear_ctrl(d,c)   # remove control: clear meta (incl. legacy), error, value
         ch.declared_full=full
     def declare(self):
         for n,ch in self.channels.items():
@@ -624,7 +635,7 @@ class Driver:
         def sctl(name,meta,val=None):
             so[0]+=1; m=dict(meta,order=so[0])
             if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}   # homeui needs title as {lang:...} object
-            self.mqtt.publish("/devices/%s/controls/%s/meta"%(sd,name),json.dumps(m),retain=True)
+            self.pub_ctrl_meta(sd,name,m)
             if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(sd,name),str(val),retain=True)
         # all fields start empty; filled by "Read" (setup_op) — nothing shown until we read a modem
         sctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},"")
@@ -654,7 +665,7 @@ class Driver:
                 def cctl(name,meta,val=None,_d=cd,_o=co):
                     _o[0]+=1; m=dict(meta,order=_o[0])
                     if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}
-                    self.mqtt.publish("/devices/%s/controls/%s/meta"%(_d,name),json.dumps(m),retain=True)
+                    self.pub_ctrl_meta(_d,name,m)
                     if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(_d,name),str(val),retain=True)
                 cctl("transmitter",{"type":"switch","readonly":False,"title":"Transmitter"})
                 cctl("magnets",{"type":"switch","readonly":False,"title":"Hold magnets"})
@@ -664,16 +675,11 @@ class Driver:
         for dev in getattr(self,"absent",[]):
             self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
             self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
-            for cname in BOAT_CONTROLS:
-                self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,cname),"",retain=True)
-                self.mqtt.publish("/devices/%s/controls/%s"%(dev,cname),"",retain=True)
+            for cname in BOAT_CONTROLS: self.clear_ctrl(dev,cname)
     def clear_device(self,dev,controls):   # wipe a device's retained topics so homeui drops the dashboard
         self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
         self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
-        for c in controls:
-            self.mqtt.publish("/devices/%s/controls/%s/meta"%(dev,c),"",retain=True)
-            self.mqtt.publish("/devices/%s/controls/%s/meta/error"%(dev,c),"",retain=True)
-            self.mqtt.publish("/devices/%s/controls/%s"%(dev,c),"",retain=True)
+        for c in controls: self.clear_ctrl(dev,c)
     def shutdown(self,*_):   # on stop (SIGTERM from systemctl): collapse boatN + ship_setup dashboards
         try:
             if self.mqtt is not None:
