@@ -36,7 +36,7 @@ defineRule("ship_diag_collect", {
                 var lines = ("" + out).trim().split("\n");
                 var path = lines.length ? lines[lines.length - 1] : "";
                 if (code === 0 && path.indexOf("/var/www/") === 0) {
-                    dev["ship_diag"]["status"] = "Готово — скачать: " + path.replace("/var/www", "");
+                    dev["ship_diag"]["status"] = "Готово. Скачать на странице: /ship-logs.html (" + path.split("/").pop() + ")";
                 } else {
                     dev["ship_diag"]["status"] = "Ошибка (код " + code + "): " + (lines.slice(-1)[0] || "");
                 }
