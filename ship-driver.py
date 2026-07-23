@@ -270,6 +270,7 @@ class Channel(threading.Thread):
         elif ctrl in self.motor_map and self.online:
             s,c=self.motor_map[ctrl]; self.motor[ctrl]=max(MOTOR_MIN,min(MOTOR_MAX,iv)); self.write_reg(s,DUTY_REG[c],self.motor[ctrl]); self.pub(ctrl,self.motor[ctrl])
         elif ctrl in self.light_map and self.online:
+            is_cmd=False   # свет не относится к ходу -> не взводит режим SAILING
             s,c=self.light_map[ctrl]; self.light[ctrl]=max(0,min(100,iv)); self.write_reg(s,DUTY_REG[c],self.light[ctrl]); self.pub(ctrl,self.light[ctrl])
         elif ctrl=="mp3_track" and self.online:
             is_cmd=False; iv=max(0,min(MP3_TRACK_MAX,iv)); self.send_mp3(mp3_frame(MP3["stop"]) if iv<=0 else mp3_frame(MP3["play"],iv)); self.pub("mp3_track",iv)
@@ -385,7 +386,8 @@ class Channel(threading.Thread):
             self.chg_setpoint=new; self.write_reg(UPS,UPS_CHG_SETPOINT,new)
     def decide(self):
         if not self.online: return SEARCH
-        if time.monotonic()-self.last_cmd < SAIL_TIMEOUT: return SAIL
+        if any(v>INIT_MOTOR for v in self.motor.values()): return SAIL   # держим SAILING, пока хоть один мотор выше холостого
+        if time.monotonic()-self.last_cmd < SAIL_TIMEOUT: return SAIL     # грейс-окно после последней команды мотором
         return CHARGE if self.tele.get("current",0)>0 else IDLE
     def set_mode(self,m):
         if m!=self.mode:
