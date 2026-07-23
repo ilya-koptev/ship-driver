@@ -1381,6 +1381,23 @@
             "type": "object",
             "title": "Корабль",
             "headerTemplate": "Корабль №{{self.address}}",
+            "default": {
+              "address": 1,
+              "channel": 16,
+              "motors": {
+                "back_left": { "slave": 12, "channel": 1 },
+                "front_left": { "slave": 12, "channel": 2 },
+                "back_right": { "slave": 11, "channel": 1 },
+                "front_right": { "slave": 11, "channel": 2 }
+              },
+              "lights": {
+                "nav_lights": { "slave": 11, "channel": 3 },
+                "morse_lamp": { "slave": 12, "channel": 3 },
+                "deck_lights": { "slave": 13, "channel": 1 },
+                "cabin_light1": { "slave": 13, "channel": 2 },
+                "cabin_light2": { "slave": 13, "channel": 3 }
+              }
+            },
             "properties": {
               "address": {
                 "type": "integer",

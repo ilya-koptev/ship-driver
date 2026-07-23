@@ -414,10 +414,16 @@ class Channel(threading.Thread):
                 else: time.sleep(SEARCH_PERIOD)
                 continue
             self.set_mode(self.decide())
+            if not getattr(self,"_warned_groups",False):   # tolerate confs from older versions (renamed/removed poll groups)
+                unknown=sorted({g for r in RATES.values() for g in r if g not in self.GROUPS})
+                if unknown: print("[%s] игнорирую незнакомые группы опроса в conf: %s"%(self.name,unknown),flush=True)
+                self._warned_groups=True
             did=False
             for g,per in RATES[self.mode].items():
+                fn=self.GROUPS.get(g)
+                if fn is None: continue                     # unknown group -> skip, don't crash the channel thread
                 if now>=self.due.get(g,0):
-                    ok=getattr(self,self.GROUPS[g])(); self.due[g]=now+per; did=True
+                    ok=getattr(self,fn)(); self.due[g]=now+per; did=True
                     if g=="current":
                         if ok or self.pwm_alive(): self.fails=0   # UPS may be off; ship still alive if any pwm8a04 answers
                         else:
