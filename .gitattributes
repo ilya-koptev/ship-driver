@@ -1,0 +1,4 @@
+# EAGLE CAD files — store byte-exact (no CRLF conversion)
+*.sch binary
+*.brd binary
+*.lbr binary
