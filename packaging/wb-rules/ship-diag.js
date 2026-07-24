@@ -1,6 +1,6 @@
 // ship-diag.js — дашборд "Сбор логов корабля".
 // Выбираешь корабль (Все / номер из настроенных) + период в часах, жмёшь "Собрать логи" —
-// драйвер собирает журнал + телеметрию из wb-mqtt-db + конфиг в /var/www/ship-logs-*.tar.gz,
+// драйвер собирает журнал + телеметрию из wb-mqtt-db + конфиг в /var/www/logs/ship-logs-*.tar.gz,
 // и в "Результат" показывает ссылку для скачивания из браузера.
 // Ставится пакетом ship-driver вместе с /usr/bin/ship-collect-logs.
 
@@ -36,7 +36,7 @@ defineRule("ship_diag_collect", {
                 var lines = ("" + out).trim().split("\n");
                 var path = lines.length ? lines[lines.length - 1] : "";
                 if (code === 0 && path.indexOf("/var/www/") === 0) {
-                    dev["ship_diag"]["status"] = "Готово. Скачать на странице: /ship-logs.html (" + path.split("/").pop() + ")";
+                    dev["ship_diag"]["status"] = "Готово. Скачать на странице: /logs (" + path.split("/").pop() + ")";
                 } else {
                     dev["ship_diag"]["status"] = "Ошибка (код " + code + "): " + (lines.slice(-1)[0] || "");
                 }
