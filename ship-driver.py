@@ -367,14 +367,19 @@ class Channel(threading.Thread):
             else: self.pub(n,r[c-1]); self.puberr(n,"")
         return ok
     def poll_freq_check(self):
-        # guard against pwm freq reverting to default: read freq block (regs 0..2) per slave, re-set INIT_FREQ + log on drift
+        # pwm freq вернулась к дефолту = модуль ребутнулся (браунаут/просадка 5 В).
+        # Одной частоты мало: после ребута ESC НЕ вооружены, и если восстановить
+        # только freq — моторы остаются мёртвыми ("не очухивается", инцидент 57%+).
+        # Поэтому форсируем ПОЛНУЮ реинициализацию: online=False -> SEARCH переловит
+        # модуль и вызовет init_ship (freq=400 + переарм ESC + холостой 40).
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
             r=self.read_regs(s,3,FREQ_REG[1],3)   # FREQ_REG[1]=0 -> [ch1,ch2,ch3]
             if r is None: continue
             for i,f in enumerate(r):
                 if f!=INIT_FREQ:
-                    self.write_reg(s,FREQ_REG[i+1],INIT_FREQ)
-                    print("[%s] pwm addr %d ch%d freq drift %d->%d, re-set"%(self.name,s,i+1,f,INIT_FREQ),flush=True)
+                    print("[%s] pwm addr %d ch%d freq drift %d->%d: модуль ребутнулся -> форсирую реинициализацию (переарм ESC)"%(self.name,s,i+1,f,INIT_FREQ),flush=True)
+                    self.online=False; self.fails=0; self.due={}   # -> run(): SEARCH -> init_ship переармит ESC и вернёт холостой
+                    return True
         return True
     GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check"}
     def thermal(self):
