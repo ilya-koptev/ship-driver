@@ -122,6 +122,9 @@ SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_pe
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
 REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
 REG_TAIL=[0x00,0x00]   # regs 0x06,0x07 (CRYPT high/low) — .6 reference; written so the full dump matches
+RSSI_BYTE=True     # E220 reg 0x05 бит7: модем дописывает 1 байт RSSI после КАЖДОГО принятого кадра.
+                   # Включаем ТОЛЬКО на береговых MOD-модемах (в lora_op). Борта (setup_op) — БЕЗ этого бита,
+                   # иначе лишний байт побьёт их локальный Modbus. Флаг обязан совпадать с реальным конфигом модема.
 LORA_DEFAULT_RAW="xxxx6760xx03000010"   # .6 reference 9-byte dump (x = variable addr/channel; 67/60 SPED/OPTION; 03 reg5; 0000 crypt; 10 version)
 LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
 SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
@@ -158,7 +161,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -215,7 +218,7 @@ class Channel(threading.Thread):
         self.mode=None; self.online=False; self.fails=0   # mode=None so the first set_mode always fires (incl. OFF gpio)
         self.declared_full=False   # whether the full control set is currently published (vs collapsed to enabled+mode)
         self.last_cmd=0.0; self.lora_read=False
-        self.chg_setpoint=CHG_FULL; self.tele={}
+        self.chg_setpoint=CHG_FULL; self.tele={}; self.rssi=None   # RSSI линка (дБм), из хвостового байта каждого ответа борта
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
@@ -240,7 +243,10 @@ class Channel(threading.Thread):
         while time.monotonic()<end and len(buf)<n:
             c=self.ser.read(n-len(buf))
             if c: buf+=c
-        return buf
+        if RSSI_BYTE and len(buf)==n:              # за целым кадром модем дописал 1 байт RSSI (packet-byte)
+            extra=self.ser.read(1)                  # он пришёл вплотную к кадру -> уже в буфере, берётся мгновенно
+            if len(extra)==1: self.rssi=-(256-extra[0])   # E220: dBm = -(256 - байт)
+        return buf   # кадр возвращаем БЕЗ RSSI-байта — read_regs/write_reg не меняются
     def read_regs(self,slave,func,addr,n):
         req=bytes([slave,func,(addr>>8)&0xFF,addr&0xFF,(n>>8)&0xFF,n&0xFF]); req+=crc16(req)
         r=self._txn(req,5+2*n)
@@ -306,7 +312,8 @@ class Channel(threading.Thread):
                 ok=True; b=r[3:11]
                 air=AIR_CODE.get(("%g"%target["air_rate"]),7); pw=PWR_CODE.get(str(int(target["power"])),0)
                 # full register dump (0x00-0x07) per .6 reference: vars (addr/air/chan/power) + fixed (SPED/OPTION hi, reg5=03, crypt=00 00)
-                des=bytes([(int(target["address"])>>8)&0xFF,int(target["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(target["channel"])&0xFF,REG5_TXMODE]+REG_TAIL)
+                reg5=REG5_TXMODE|0x80 if RSSI_BYTE else REG5_TXMODE   # бит7 = packet-byte RSSI (только береговой модем)
+                des=bytes([(int(target["address"])>>8)&0xFF,int(target["address"])&0xFF,SPED_BASE|air,OPTION_BASE|pw,int(target["channel"])&0xFF,reg5]+REG_TAIL)
                 print("[%s] modem raw=%s want=%s"%(self.name,b.hex(),des.hex()),flush=True)
                 if bytes(b[0:len(des)])!=des:   # any byte differs -> write the whole dump
                     print("[%s] writing config to modem (all bytes)"%self.name,flush=True)
@@ -353,6 +360,7 @@ class Channel(threading.Thread):
         self.tele["current"]=s16(r[3])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current","")
         self.pub("battery_voltage",round(r[2]*0.001,2)); self.puberr("battery_voltage","")   # Vbat (АКБ, ~8 В) — рядом с зарядом
         self.pub("input_voltage",round(r[0]*0.001,2)); self.puberr("input_voltage","")
+        if self.rssi is not None: self.pub("rssi",self.rssi); self.puberr("rssi","")   # обновлён чтением выше
         return True
     def pwm_alive(self):   # ship reachable via pwm even when UPS is off — probe each pwm8a04 frequency register
         for s in PWM_SLAVES:
@@ -642,7 +650,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
