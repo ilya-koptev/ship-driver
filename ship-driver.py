@@ -760,6 +760,8 @@ class Driver:
             if write:
                 # write OUR defaults for everything except address+channel (which come from the fields)
                 air=AIR_CODE.get(("%g"%SETUP_DEFAULTS["air_rate"]),7); pw=PWR_CODE.get(str(int(SETUP_DEFAULTS["power"])),0)
+                # reg5 = REG5_TXMODE БЕЗ бита packet-byte (0x80): на БОРТУ его включать нельзя — приёмный модем
+                # борта допишет байт RSSI к нашему Modbus-ЗАПРОСУ и побьёт локальную шину pwm/УПС. packet-byte только на берегу (lora_op).
                 msg=bytes([0xC0,0x00,0x08,(self.setup_number>>8)&0xFF,self.setup_number&0xFF,SPED_BASE|air,OPTION_BASE|pw,self.setup_channel&0xFF,REG5_TXMODE,0x00,0x00])
                 ser.reset_input_buffer(); ser.write(msg); ser.flush(); time.sleep(0.5); ser.read(64)
             ser.reset_input_buffer(); ser.write(bytes([0xC1,0x00,0x09])); ser.flush(); time.sleep(0.4); r=ser.read(64)
