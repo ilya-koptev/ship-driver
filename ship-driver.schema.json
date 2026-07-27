@@ -293,7 +293,8 @@
             },
             "offline_fails": {
               "type": "integer",
-              "title": "Промахов тока до SEARCH",
+              "title": "Промахов подряд (весь борт молчит) до ухода в SEARCH",
+              "default": 3,
               "minimum": 1,
               "propertyOrder": 5
             },

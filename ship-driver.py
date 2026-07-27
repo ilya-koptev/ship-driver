@@ -337,6 +337,16 @@ class Channel(threading.Thread):
         for n,s,c in self.lights: self.light[n]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
         for n,s,c in self.motors: self.pub(n,self.motor[n])
         for n,s,c in self.lights: self.pub(n,self.light[n])
+    def pwm_kept_state(self):
+        # True, если все pwm-каналы всё ещё держат INIT_FREQ -> модули не теряли питание (был провал связи, не ребут)
+        for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
+            r=self.read_regs(s,3,FREQ_REG[1],3)
+            if r is None or any(f!=INIT_FREQ for f in r): return False
+        return True
+    def resume_ship(self):
+        # реконнект после короткого провала связи: модули живы, просто заново утверждаем последний заданный газ/свет — БЕЗ сброса в холостой
+        for n,s,c in self.motors: self.write_reg(s,DUTY_REG[c],self.motor[n]); self.pub(n,self.motor[n])
+        for n,s,c in self.lights: self.write_reg(s,DUTY_REG[c],self.light[n]); self.pub(n,self.light[n])
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_VIN,4)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat (input voltage rides along at the 5 s current rate)
         if r is None: self.puberr("battery_current","r"); self.puberr("battery_voltage","r"); self.puberr("input_voltage","r"); return False
@@ -416,9 +426,16 @@ class Channel(threading.Thread):
             if not self.online:
                 self.set_mode(SEARCH)
                 if self.poll_current() or self.pwm_alive():
+                    dt=now-getattr(self,"offline_since",now)
                     self.fails=0; self.online=True; self.due={}   # due={} -> re-poll all groups at once on (re)connect
                     self.drv.boat_controls(self,True)             # restore full dashboard before init/poll fills values
-                    self.init_ship(); self.last_cmd=0.0; self.set_mode(self.decide())
+                    if self.pwm_kept_state():                     # модули не ребутились -> это был провал связи: НЕ сбрасываем газ
+                        print("[%s] снова на связи после %.1f с (провал связи, питание не терялось) -> восстанавливаю газ без init"%(self.name,dt),flush=True)
+                        self.resume_ship()
+                    else:                                         # модуль ребутнулся (потеря питания) -> полная реинициализация + переарм ESC
+                        print("[%s] снова на связи после %.1f с (модуль ребутнулся) -> init_ship"%(self.name,dt),flush=True)
+                        self.init_ship(); self.last_cmd=0.0
+                    self.set_mode(self.decide())
                 else: time.sleep(SEARCH_PERIOD)
                 continue
             self.set_mode(self.decide())
@@ -436,7 +453,10 @@ class Channel(threading.Thread):
                         if ok or self.pwm_alive(): self.fails=0   # UPS may be off; ship still alive if any pwm8a04 answers
                         else:
                             self.fails+=1
-                            if self.fails>=OFFLINE_FAILS: self.online=False; self.set_mode(SEARCH)
+                            print("[%s] промах связи #%d (UPS и все pwm не ответили)"%(self.name,self.fails),flush=True)
+                            if self.fails>=OFFLINE_FAILS:
+                                print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
+                                self.offline_since=now; self.online=False; self.set_mode(SEARCH)
             if self.mode==CHARGE: self.thermal()
             if not did: time.sleep(0.2)
 
