@@ -43,10 +43,14 @@ mosquitto_sub -h 192.168.69.105 -t '/devices/boat4/controls/mode' -C 1
 | `mode` | `/devices/boat4/controls/mode` | ro | `SEARCH` / `SAILING` / `CHARGING` / `IDLE` / `OFF` |
 | `enabled` | `/devices/boat4/controls/enabled` | rw | `0` / `1` |
 | `ship_number` | `/devices/boat4/controls/ship_number` | rw | `0–65535` — LoRa-адрес корабля, пишется в модем немедленно |
-| `battery_current` | `/devices/boat4/controls/battery_current` | ro | A, float · сейчас −0.144 A · период 5 с в IDLE |
-| `battery_temperature` | `/devices/boat4/controls/battery_temperature` | ro | °C · сейчас 26.9 °C · 5 мин в IDLE, 10 с в CHARGING |
-| `charge_level` | `/devices/boat4/controls/charge_level` | ro | % · сейчас 47.8 % · 5 мин в IDLE |
+| `battery_current` | `/devices/boat4/controls/battery_current` | ro | A, float · разряд отрицательный · период 5 с в IDLE |
+| `battery_voltage` | `/devices/boat4/controls/battery_voltage` | ro | В · напряжение АКБ (~8 В) · вместе с током |
+| `battery_temperature` | `/devices/boat4/controls/battery_temperature` | ro | °C · 5 мин в IDLE, 10 с в CHARGING |
+| `charge_level` | `/devices/boat4/controls/charge_level` | ro | % заряда |
 | `input_voltage` | `/devices/boat4/controls/input_voltage` | ro | В · входное напряжение ИБП · период 5 с (читается вместе с током) |
+| `rssi` | `/devices/boat4/controls/rssi` | ro | дБм · RSSI LoRa‑линка активного борта (E220 packet‑byte) |
+| `comms_errors` | `/devices/boat4/controls/comms_errors` | ro | сырых промахов чтения за скользящие 5 мин |
+| `link_quality` | `/devices/boat4/controls/link_quality` | ro | % успешных чтений за 5 мин (100 = идеал) |
 | `back_left` / `front_left` / `back_right` / `front_right` | `/devices/boat4/controls/{name}` | rw | `40–80` (40 = холостой ход) |
 | `nav_lights` / `morse_lamp` / `deck_lights` / `cabin_light1` / `cabin_light2` | `/devices/boat4/controls/{name}` | rw | `0–100` % |
 | `mp3_track` | `/devices/boat4/controls/mp3_track` | rw | `0` = стоп, `1–15` = трек |
