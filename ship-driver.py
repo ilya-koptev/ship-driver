@@ -3,8 +3,9 @@
 # 4 equivalent LoRa transmitters (MOD1-4 = /dev/ttyMOD1..4). Each channel independently owns its
 # port and runs the SAME ship logic against one active ship (Modbus addrs identical on every ship:
 # UPS=10, pwm=11/12/13; ships are told apart by LoRa address -> change the channel modem address to
-# switch ship). Per channel: Modbus RTU + inline DFPlayer + mode state machine + poll schedule +
-# simple charge-thermal. Tunables live in /etc/ship-driver.conf (defaults below if absent).
+# switch ship). Per channel: Modbus RTU + inline DFPlayer + mode state machine + poll schedule.
+# Charge thermal protection (charge blocked >+50 °C) is done by WB-UPS-v3 itself; driver only sets
+# full charge current. Tunables live in /etc/ship-driver.conf (defaults below if absent).
 # boatN MQTT device = operational API + visualisation (driven by external software); LoRa config
 # lives in the conf, only LoRa_address is live on boatN (writes the modem immediately, applying the
 # conf channel/air/power + the new address). Wired ship pre-config stays on the "Ship Setup" dashboard.
@@ -65,7 +66,7 @@ SEARCH="SEARCH"; SAIL="SAILING"; CHARGE="CHARGING"; IDLE="IDLE"; SERVICE="SERVIC
 DEFAULTS={
  "main":{
  "baud":9600, "resp_timeout_s":0.8,
- "charge":{"full_ma":2000,"low_ma":600,"t_limit_c":50.0,"t_restore_c":48.0},
+ "charge":{"full_ma":2000},   # ток заряда; тепловая защита заряда — в самом WB-UPS-v3 (>+50 °C), драйвер её не дублирует
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
  "rates":{
@@ -111,8 +112,7 @@ C=load_conf()
 
 M=C["main"]
 BAUD=M["baud"]; RESP_TO=M["resp_timeout_s"]
-CHG_FULL=M["charge"]["full_ma"]; CHG_LOW=M["charge"]["low_ma"]
-T_LIMIT=M["charge"]["t_limit_c"]; T_RESTORE=M["charge"]["t_restore_c"]
+CHG_FULL=M["charge"]["full_ma"]   # ток заряда; тепловую защиту (отсечка >+50 °C) делает сам WB-UPS-v3, драйверный thermal убран
 INIT_FREQ=M["init"]["freq"]; INIT_MOTOR=M["init"]["motor"]; INIT_LIGHT=M["init"]["light"]
 MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]
 MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardcoded
@@ -417,14 +417,6 @@ class Channel(threading.Thread):
                     return True
         return True
     GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check"}
-    def thermal(self):
-        t=self.tele.get("temp")
-        if t is None: return
-        new=self.chg_setpoint
-        if t>T_LIMIT: new=CHG_LOW
-        elif t<T_RESTORE: new=CHG_FULL
-        if new!=self.chg_setpoint:
-            self.chg_setpoint=new; self.write_reg(UPS,UPS_CHG_SETPOINT,new)
     def decide(self):
         if not self.online: return SEARCH
         if any(v>INIT_MOTOR for v in self.motor.values()): return SAIL   # держим SAILING, пока хоть один мотор выше холостого
@@ -483,7 +475,6 @@ class Channel(threading.Thread):
                             if self.fails>=OFFLINE_FAILS:
                                 print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
                                 self.offline_since=now; self.online=False; self.set_mode(SEARCH)
-            if self.mode==CHARGE: self.thermal()
             if not did: time.sleep(0.2)
 
 class ModbusTCP:

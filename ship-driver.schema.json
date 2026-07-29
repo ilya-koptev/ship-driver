@@ -167,25 +167,9 @@
           "properties": {
             "full_ma": {
               "type": "integer",
-              "title": "Штатный ток, мА",
+              "title": "Ток заряда, мА",
               "minimum": 0,
               "propertyOrder": 1
-            },
-            "low_ma": {
-              "type": "integer",
-              "title": "Ток при перегреве, мА",
-              "minimum": 0,
-              "propertyOrder": 2
-            },
-            "t_limit_c": {
-              "type": "number",
-              "title": "Порог снижения, °C",
-              "propertyOrder": 3
-            },
-            "t_restore_c": {
-              "type": "number",
-              "title": "Порог возврата, °C",
-              "propertyOrder": 4
             }
           },
           "options": {
