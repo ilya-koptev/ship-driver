@@ -72,7 +72,7 @@ DEFAULTS={
    "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10},
    "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10},
    "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":10},
-   "sail_timeout_s":30.0, "offline_fails":2,
+   "sail_timeout_s":30.0, "offline_fails":2, "read_tries":2,
    "search_period":0.05, "service_period":1.0},
  "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
  },
@@ -119,6 +119,8 @@ MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardco
 RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
+READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
+COMMS_WIN=300.0   # окно скользящего счётчика ошибок связи, с
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
 REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
 REG_TAIL=[0x00,0x00]   # regs 0x06,0x07 (CRYPT high/low) — .6 reference; written so the full dump matches
@@ -161,7 +163,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -219,6 +221,8 @@ class Channel(threading.Thread):
         self.declared_full=False   # whether the full control set is currently published (vs collapsed to enabled+mode)
         self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}; self.rssi=None   # RSSI линка (дБм), из хвостового байта каждого ответа борта
+        self._rd_att=[]; self._rd_miss=[]   # тайминги попыток/промахов чтения за скользящее окно (сырое качество линка)
+        self.force_init=False               # осознанная смена корабля -> при реконнекте полный init_ship, а не resume
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
@@ -249,9 +253,12 @@ class Channel(threading.Thread):
         return buf   # кадр возвращаем БЕЗ RSSI-байта — read_regs/write_reg не меняются
     def read_regs(self,slave,func,addr,n):
         req=bytes([slave,func,(addr>>8)&0xFF,addr&0xFF,(n>>8)&0xFF,n&0xFF]); req+=crc16(req)
-        r=self._txn(req,5+2*n)
-        if len(r)>=5+2*n and r[0]==slave and r[1]==func and r[2]==2*n and crc16(r[:3+2*n])==r[3+2*n:5+2*n]:
-            return [ (r[3+2*i]<<8)|r[4+2*i] for i in range(n) ]
+        for attempt in range(READ_TRIES):
+            if attempt: time.sleep(READ_RETRY_GAP)            # пауза перед повтором (опоздавший по радио кадр не столкнётся)
+            r=self._txn(req,5+2*n); t=time.monotonic(); self._rd_att.append(t)   # учёт качества линка: сырая попытка
+            if len(r)>=5+2*n and r[0]==slave and r[1]==func and r[2]==2*n and crc16(r[:3+2*n])==r[3+2*n:5+2*n]:
+                return [ (r[3+2*i]<<8)|r[4+2*i] for i in range(n) ]
+            self._rd_miss.append(t)                           # промах (таймаут/битый CRC) — считаем каждую неудачную попытку
         return None
     def write_reg(self,slave,addr,val):
         val&=0xFFFF; req=bytes([slave,6,(addr>>8)&0xFF,addr&0xFF,(val>>8)&0xFF,val&0xFF]); req+=crc16(req)
@@ -287,6 +294,7 @@ class Channel(threading.Thread):
             is_cmd=False; changed=(iv!=self.lora["address"])
             self.lora["address"]=iv; self.apply_wiring(); self.pub(ctrl,iv); self.drv.save(); self.lora_op(self.lora)
             if changed:   # switched to a DIFFERENT boat -> re-detect so init_ship (freq=400 + idle, which arms the motor ESCs) runs for it
+                self.force_init=True   # смена корабля -> полный init_ship (сброс в холостой + переарм), НЕ resume: не тащим газ с прежнего борта
                 self.online=False; self.fails=0; self.due={}
                 print("[%s] ship_number -> %d: forcing re-init (SEARCH) for the new boat"%(self.name,iv),flush=True)
         else: is_cmd=False
@@ -354,8 +362,17 @@ class Channel(threading.Thread):
         # реконнект после короткого провала связи: модули живы, просто заново утверждаем последний заданный газ/свет — БЕЗ сброса в холостой
         for n,s,c in self.motors: self.write_reg(s,DUTY_REG[c],self.motor[n]); self.pub(n,self.motor[n])
         for n,s,c in self.lights: self.write_reg(s,DUTY_REG[c],self.light[n]); self.pub(n,self.light[n])
+    def pub_comms(self):
+        # скользящее окно COMMS_WIN: сырые промахи чтения (до маскировки ретраем) + % качества линка активного корабля
+        cut=time.monotonic()-COMMS_WIN
+        self._rd_att=[t for t in self._rd_att if t>=cut]
+        self._rd_miss=[t for t in self._rd_miss if t>=cut]
+        errs=len(self._rd_miss); att=len(self._rd_att)
+        self.pub("comms_errors",errs)
+        self.pub("link_quality",round(100.0*(1-errs/att),1) if att else 100.0)
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_VIN,4)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat (input voltage rides along at the 5 s current rate)
+        self.pub_comms()   # счётчики связи обновляем каждым опросом (учитывают и этот промах, если был)
         if r is None: self.puberr("battery_current","r"); self.puberr("battery_voltage","r"); self.puberr("input_voltage","r"); return False
         self.tele["current"]=s16(r[3])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current","")
         self.pub("battery_voltage",round(r[2]*0.001,2)); self.puberr("battery_voltage","")   # Vbat (АКБ, ~8 В) — рядом с зарядом
@@ -437,12 +454,13 @@ class Channel(threading.Thread):
                     dt=now-getattr(self,"offline_since",now)
                     self.fails=0; self.online=True; self.due={}   # due={} -> re-poll all groups at once on (re)connect
                     self.drv.boat_controls(self,True)             # restore full dashboard before init/poll fills values
-                    if self.pwm_kept_state():                     # модули не ребутились -> это был провал связи: НЕ сбрасываем газ
+                    if self.pwm_kept_state() and not self.force_init:   # провал связи (не смена корабля), модули живы -> НЕ сбрасываем газ
                         print("[%s] снова на связи после %.1f с (провал связи, питание не терялось) -> восстанавливаю газ без init"%(self.name,dt),flush=True)
                         self.resume_ship()
-                    else:                                         # модуль ребутнулся (потеря питания) -> полная реинициализация + переарм ESC
-                        print("[%s] снова на связи после %.1f с (модуль ребутнулся) -> init_ship"%(self.name,dt),flush=True)
+                    else:                                              # смена корабля ИЛИ ребут модуля -> полный init (сброс в холостой + переарм)
+                        print("[%s] снова на связи после %.1f с (%s) -> init_ship"%(self.name,dt,"смена корабля" if self.force_init else "модуль ребутнулся"),flush=True)
                         self.init_ship(); self.last_cmd=0.0
+                    self.force_init=False
                     self.set_mode(self.decide())
                 else: time.sleep(SEARCH_PERIOD)
                 continue
@@ -650,7 +668,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
