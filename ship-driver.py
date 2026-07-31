@@ -228,7 +228,10 @@ class Channel(threading.Thread):
         self._rd_kind={"to":[],"short":[],"crc":[],"hdr":[]}   # подписи отказа: to=ничего не пришло (похоже на радио), остальные=фрейминг/тайминги
         self._rd_retry_ok=[]                # промахи, вылеченные повтором (подпись тайминга, не фединга)
         self._lat=[]                        # (t, мс) латентность успешных чтений
-        self.force_init=False               # осознанная смена корабля -> при реконнекте полный init_ship, а не resume
+        # True при старте процесса: своего прошлого состояния мы не знаем (self.motor нулевой), а ESC надо взвести —
+        # значит первый выход на связь = полный init_ship. Иначе resume_ship записал бы нули как «желаемый» газ.
+        self.force_init=True                # также ставится при осознанной смене корабля
+        self.f16=None                       # поддержка Modbus func16 (блочная запись): None=не пробовали, True/False=выяснено
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
@@ -292,6 +295,27 @@ class Channel(threading.Thread):
                             self.rssi,len(r),r[:12].hex() if r else ""),flush=True)
         if live: self._rd_fail.append(time.monotonic())        # отказ после всех попыток = «настоящая» ошибка
         return None
+    def write_regs(self,slave,addr,vals):
+        # Modbus func 16 — несколько ПОДРЯД идущих регистров одним кадром (вместо N кадров по func 6).
+        # Экономит эфир: оба мотора модуля = 1 транзакция вместо 2, инициализация модуля = 1 вместо 3.
+        # Если модуль func 16 не понимает — откатываемся на поштучную запись и больше не пробуем.
+        if not vals: return True
+        if self.f16 is False: return all(self.write_reg(slave,addr+i,v) for i,v in enumerate(vals))
+        n=len(vals)
+        req=bytes([slave,16,(addr>>8)&0xFF,addr&0xFF,(n>>8)&0xFF,n&0xFF,2*n])
+        for v in vals: req+=bytes([(int(v)>>8)&0xFF,int(v)&0xFF])
+        req+=crc16(req)
+        r=self._txn(req,8)
+        ok=(len(r)>=8 and r[0]==slave and r[1]==16 and crc16(r[:6])==r[6:8])
+        if ok:
+            if self.f16 is None:
+                self.f16=True; print("[%s] func16 (блочная запись) поддерживается"%self.name,flush=True)
+            return True
+        if self.f16 is None:   # первая проба не удалась — считаем func16 неподдержанным и дальше пишем поштучно
+            self.f16=False
+            print("[%s] func16 не подтверждён (ответ %s) -> поштучная запись"%(self.name,r[:4].hex() if r else "нет"),flush=True)
+            return all(self.write_reg(slave,addr+i,v) for i,v in enumerate(vals))
+        return False   # func16 работал раньше -> это транзиентная потеря, значение дожмёт сверка readback
     def write_reg(self,slave,addr,val):
         val&=0xFFFF; req=bytes([slave,6,(addr>>8)&0xFF,addr&0xFF,(val>>8)&0xFF,val&0xFF]); req+=crc16(req)
         r=self._txn(req,8); return len(r)>=8 and r[0]==slave and r[1]==6
@@ -378,10 +402,12 @@ class Channel(threading.Thread):
     # ---- ship logic ----
     def init_ship(self):
         print("[%s] init_ship ship=%d: freq=%d, motors->idle(%d), lights->%d"%(self.name,self.lora["address"],INIT_FREQ,INIT_MOTOR,INIT_LIGHT),flush=True)
-        for s,c in ALL_CH: self.write_reg(s,DUTY_REG[c],0)          # 1) power (duty) off on every channel first
-        for s,c in ALL_CH: self.write_reg(s,FREQ_REG[c],INIT_FREQ)  # 2) then pwm frequency = 400
-        for n,s,c in self.motors: self.motor[n]=INIT_MOTOR; self.write_reg(s,DUTY_REG[c],INIT_MOTOR)  # 3) then motors to idle (40)
-        for n,s,c in self.lights: self.light[n]=INIT_LIGHT; self.write_reg(s,DUTY_REG[c],INIT_LIGHT)
+        # Блочно (func16): по одному кадру на модуль вместо трёх — было 18 транзакций на инициализацию, стало 6.
+        for s in PWM_SLAVES: self.write_regs(s,DUTY_REG[1],[0,0,0])             # 1) power (duty) off on every channel first
+        for s in PWM_SLAVES: self.write_regs(s,FREQ_REG[1],[INIT_FREQ]*3)      # 2) then pwm frequency = 400
+        for n,s,c in self.motors: self.motor[n]=INIT_MOTOR
+        for n,s,c in self.lights: self.light[n]=INIT_LIGHT
+        self.push_duty()                                                        # 3) моторы в холостой + свет — блоками по модулям
         for n,s,c in self.motors: self.pub(n,self.motor[n])
         for n,s,c in self.lights: self.pub(n,self.light[n])
     def pwm_kept_state(self):
@@ -390,10 +416,22 @@ class Channel(threading.Thread):
             r=self.read_regs(s,3,FREQ_REG[1],3)
             if r is None or any(f!=INIT_FREQ for f in r): return False
         return True
+    def push_duty(self):
+        # Разложить желаемые скважности по модулям и записать блоками (func16): 1 кадр на модуль вместо 3.
+        want={}
+        for n,s,c in self.motors: want.setdefault(s,{})[c]=self.motor[n]
+        for n,s,c in self.lights: want.setdefault(s,{})[c]=self.light[n]
+        for s,chans in want.items():
+            cs=sorted(chans)
+            if cs==list(range(cs[0],cs[0]+len(cs))):                     # каналы подряд -> один кадр
+                self.write_regs(s,DUTY_REG[cs[0]],[chans[c] for c in cs])
+            else:
+                for c in cs: self.write_reg(s,DUTY_REG[c],chans[c])      # с дырой — поштучно
     def resume_ship(self):
         # реконнект после короткого провала связи: модули живы, просто заново утверждаем последний заданный газ/свет — БЕЗ сброса в холостой
-        for n,s,c in self.motors: self.write_reg(s,DUTY_REG[c],self.motor[n]); self.pub(n,self.motor[n])
-        for n,s,c in self.lights: self.write_reg(s,DUTY_REG[c],self.light[n]); self.pub(n,self.light[n])
+        self.push_duty()
+        for n,s,c in self.motors: self.pub(n,self.motor[n])
+        for n,s,c in self.lights: self.pub(n,self.light[n])
     def pub_comms(self):
         # скользящее окно COMMS_WIN. Ключевое различие:
         #   comms_errors   — сырые промахи попыток (качество канала, до маскировки ретраем)
