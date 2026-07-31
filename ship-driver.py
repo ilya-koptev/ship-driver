@@ -73,7 +73,7 @@ DEFAULTS={
    "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10},
    "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10},
    "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":10},
-   "sail_timeout_s":30.0, "offline_fails":2, "read_tries":2,
+   "sail_timeout_s":30.0, "offline_fails":2, "read_tries":2, "tx_gap_ms":0,
    "search_period":0.05, "service_period":1.0},
  "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
  },
@@ -120,7 +120,9 @@ RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
-COMMS_WIN=300.0   # окно скользящего счётчика ошибок связи, с
+TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
+COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
+DIAG_LOG=True     # писать в журнал строку на каждый промах чтения (тип/slave/RSSI/байты) — для разбора природы ошибок
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
 REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
 REG_TAIL=[0x00,0x00]   # regs 0x06,0x07 (CRYPT high/low) — .6 reference; written so the full dump matches
@@ -163,7 +165,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -222,6 +224,10 @@ class Channel(threading.Thread):
         self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}; self.rssi=None   # RSSI линка (дБм), из хвостового байта каждого ответа борта
         self._rd_att=[]; self._rd_miss=[]   # тайминги попыток/промахов чтения за скользящее окно (сырое качество линка)
+        self._rd_fail=[]                    # отказы ПОСЛЕ всех ретраев — «настоящие» ошибки, видимые оператору
+        self._rd_kind={"to":[],"short":[],"crc":[],"hdr":[]}   # подписи отказа: to=ничего не пришло (похоже на радио), остальные=фрейминг/тайминги
+        self._rd_retry_ok=[]                # промахи, вылеченные повтором (подпись тайминга, не фединга)
+        self._lat=[]                        # (t, мс) латентность успешных чтений
         self.force_init=False               # осознанная смена корабля -> при реконнекте полный init_ship, а не resume
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
@@ -242,6 +248,7 @@ class Channel(threading.Thread):
             except Exception: pass
             self.ser=None
     def _txn(self,req,n):
+        if TX_GAP: time.sleep(TX_GAP)          # пауза перед транзакцией (модем домолчал / переключил TX-RX); 0 = выключено
         self.ser.reset_input_buffer(); self.ser.write(req); self.ser.flush()
         end=time.monotonic()+RESP_TO; buf=b""
         while time.monotonic()<end and len(buf)<n:
@@ -252,13 +259,38 @@ class Channel(threading.Thread):
             if len(extra)==1: self.rssi=-(256-extra[0])   # E220: dBm = -(256 - байт)
         return buf   # кадр возвращаем БЕЗ RSSI-байта — read_regs/write_reg не меняются
     def read_regs(self,slave,func,addr,n):
+        # Диагностика природы отказов: каждая неудачная попытка классифицируется.
+        #   to    — не пришло НИ БАЙТА (пакет потерян целиком) -> подпись радио
+        #   short — пришёл обрывок кадра                        -> фрейминг/тайминги
+        #   hdr   — чужой slave/func/длина (мусор из прошлого обмена) -> тайминги
+        #   crc   — кадр целый, но CRC не сошёлся               -> помеха/искажение
+        # Плюс latency успешных чтений и «вылечено повтором» — фединг так быстро не проходит.
         req=bytes([slave,func,(addr>>8)&0xFF,addr&0xFF,(n>>8)&0xFF,n&0xFF]); req+=crc16(req)
-        for attempt in range(READ_TRIES):
+        need=5+2*n
+        # В SEARCH (борт не на связи) неответ — это НЕ ошибка связи, а «борта здесь нет»:
+        # не повторяем (зря занимали бы эфир вдвое) и не засоряем ни счётчики, ни журнал.
+        live=self.online
+        for attempt in range(READ_TRIES if live else 1):
             if attempt: time.sleep(READ_RETRY_GAP)            # пауза перед повтором (опоздавший по радио кадр не столкнётся)
-            r=self._txn(req,5+2*n); t=time.monotonic(); self._rd_att.append(t)   # учёт качества линка: сырая попытка
-            if len(r)>=5+2*n and r[0]==slave and r[1]==func and r[2]==2*n and crc16(r[:3+2*n])==r[3+2*n:5+2*n]:
+            t0=time.monotonic()
+            r=self._txn(req,need); t=time.monotonic()
+            if live: self._rd_att.append(t)                   # учёт качества линка: сырая попытка
+            if len(r)==0: kind="to"
+            elif len(r)<need: kind="short"
+            elif r[0]!=slave or r[1]!=func or r[2]!=2*n: kind="hdr"
+            elif crc16(r[:3+2*n])!=r[3+2*n:5+2*n]: kind="crc"
+            else:
+                self._lat.append((t,(t-t0)*1000.0))
+                if attempt: self._rd_retry_ok.append(t)       # промах вылечен повтором
                 return [ (r[3+2*i]<<8)|r[4+2*i] for i in range(n) ]
-            self._rd_miss.append(t)                           # промах (таймаут/битый CRC) — считаем каждую неудачную попытку
+            if live:                                          # промахи зондирования в SEARCH не считаем и не логируем
+                self._rd_miss.append(t)
+                self._rd_kind[kind].append(t)
+                if DIAG_LOG:
+                    print("[%s] промах чтения: тип=%s slave=%d reg=%d n=%d попытка=%d/%d ждал=%.0fмс rssi=%s байт=%d %s"
+                          %(self.name,kind,slave,addr,n,attempt+1,READ_TRIES,(t-t0)*1000.0,
+                            self.rssi,len(r),r[:12].hex() if r else ""),flush=True)
+        if live: self._rd_fail.append(time.monotonic())        # отказ после всех попыток = «настоящая» ошибка
         return None
     def write_reg(self,slave,addr,val):
         val&=0xFFFF; req=bytes([slave,6,(addr>>8)&0xFF,addr&0xFF,(val>>8)&0xFF,val&0xFF]); req+=crc16(req)
@@ -363,13 +395,26 @@ class Channel(threading.Thread):
         for n,s,c in self.motors: self.write_reg(s,DUTY_REG[c],self.motor[n]); self.pub(n,self.motor[n])
         for n,s,c in self.lights: self.write_reg(s,DUTY_REG[c],self.light[n]); self.pub(n,self.light[n])
     def pub_comms(self):
-        # скользящее окно COMMS_WIN: сырые промахи чтения (до маскировки ретраем) + % качества линка активного корабля
+        # скользящее окно COMMS_WIN. Ключевое различие:
+        #   comms_errors   — сырые промахи попыток (качество канала, до маскировки ретраем)
+        #   read_failures  — отказы ПОСЛЕ всех ретраев = реально потерянные данные (то, что видит оператор)
         cut=time.monotonic()-COMMS_WIN
         self._rd_att=[t for t in self._rd_att if t>=cut]
         self._rd_miss=[t for t in self._rd_miss if t>=cut]
+        self._rd_fail=[t for t in self._rd_fail if t>=cut]
+        self._rd_retry_ok=[t for t in self._rd_retry_ok if t>=cut]
+        for k in self._rd_kind: self._rd_kind[k]=[t for t in self._rd_kind[k] if t>=cut]
+        self._lat=[(t,v) for (t,v) in self._lat if t>=cut]
         errs=len(self._rd_miss); att=len(self._rd_att)
         self.pub("comms_errors",errs)
         self.pub("link_quality",round(100.0*(1-errs/att),1) if att else 100.0)
+        self.pub("read_failures",len(self._rd_fail))
+        self.pub("err_timeout",len(self._rd_kind["to"]))                                    # «радийная» подпись
+        self.pub("err_frame",len(self._rd_kind["short"])+len(self._rd_kind["hdr"])+len(self._rd_kind["crc"]))  # фрейминг/тайминги/искажение
+        self.pub("retry_fixed",len(self._rd_retry_ok))
+        if self._lat:
+            v=sorted(x for _,x in self._lat)
+            self.pub("lat_p95",round(v[min(len(v)-1,int(0.95*len(v)))],0))
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_VIN,4)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat (input voltage rides along at the 5 s current rate)
         self.pub_comms()   # счётчики связи обновляем каждым опросом (учитывают и этот промах, если был)
@@ -659,7 +704,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})

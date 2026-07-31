@@ -282,11 +282,25 @@
               "minimum": 1,
               "propertyOrder": 5
             },
+            "read_tries": {
+              "type": "integer",
+              "title": "Попыток чтения (1 = без повтора)",
+              "default": 2,
+              "minimum": 1,
+              "propertyOrder": 6
+            },
+            "tx_gap_ms": {
+              "type": "integer",
+              "title": "Пауза перед транзакцией, мс (0 = без паузы)",
+              "default": 0,
+              "minimum": 0,
+              "propertyOrder": 7
+            },
             "search_period": {
               "type": "number",
               "title": "Период зондирования в SEARCH, с",
               "minimum": 0,
-              "propertyOrder": 6
+              "propertyOrder": 8
             },
             "service_period": {
               "type": "number",

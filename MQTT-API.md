@@ -51,6 +51,11 @@ mosquitto_sub -h 192.168.69.105 -t '/devices/boat4/controls/mode' -C 1
 | `rssi` | `/devices/boat4/controls/rssi` | ro | дБм · RSSI LoRa‑линка активного борта (E220 packet‑byte) |
 | `comms_errors` | `/devices/boat4/controls/comms_errors` | ro | сырых промахов чтения за скользящие 5 мин |
 | `link_quality` | `/devices/boat4/controls/link_quality` | ro | % успешных чтений за 5 мин (100 = идеал) |
+| `read_failures` | `/devices/boat4/controls/read_failures` | ro | отказов чтения **после всех повторов** за 5 мин = реально потерянные данные |
+| `err_timeout` | `/devices/boat4/controls/err_timeout` | ro | отказов «не пришло ни байта» за 5 мин |
+| `err_frame` | `/devices/boat4/controls/err_frame` | ro | отказов «обрывок / чужой кадр / битый CRC» за 5 мин |
+| `retry_fixed` | `/devices/boat4/controls/retry_fixed` | ro | промахов, вылеченных повтором, за 5 мин |
+| `lat_p95` | `/devices/boat4/controls/lat_p95` | ro | мс · латентность чтения, 95‑й перцентиль |
 | `back_left` / `front_left` / `back_right` / `front_right` | `/devices/boat4/controls/{name}` | rw | `40–80` (40 = холостой ход) |
 | `nav_lights` / `morse_lamp` / `deck_lights` / `cabin_light1` / `cabin_light2` | `/devices/boat4/controls/{name}` | rw | `0–100` % |
 | `mp3_track` | `/devices/boat4/controls/mp3_track` | rw | `0` = стоп, `1–15` = трек |
