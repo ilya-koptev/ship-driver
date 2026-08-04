@@ -76,9 +76,6 @@ DEFAULTS={
  "charge":{"full_ma":2000},   # ток заряда; тепловая защита заряда — в самом WB-UPS-v3 (>+50 °C), драйвер её не дублирует
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
- # Датчик курса (WitMotion WT901C485/JY-901 на бортовой шине). Отдаёт уже посчитанный угол —
- # интегрировать ничего не нужно. Выводим только курс (yaw, рег. 0x3F); крен/дифферент не нужны.
- "sensor":{"enabled":True,"address":14,"invert":False},
  "rates":{
    "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10,"course":10},
    "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10,"course":1},
@@ -129,7 +126,6 @@ MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardco
 RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
-_S=M.get("sensor",{}) ; SENSOR_ON=bool(_S.get("enabled",True)); SENSOR_ADDR=int(_S.get("address",14)); SENSOR_INVERT=bool(_S.get("invert",False))
 SENSOR_GIVEUP=3   # столько неудач подряд -> считаем, что на этом борту датчика нет, и перестаём его дёргать
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
@@ -150,10 +146,12 @@ def grkch(ch):
     except Exception: return "?"
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
 ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
-def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[(name,slave,ch)] in conf order)
+SENSOR_FALLBACK={"enabled":True,"address":14,"invert":False}
+def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[...], sensor{...}) — всё это per-ship
     motors=[(n,m["slave"],m["channel"]) for n,m in w["motors"].items()]
     lights=[(n,l["slave"],l["channel"]) for n,l in w["lights"].items()]
-    return motors,{n:(s,c) for n,s,c in motors},lights
+    sen=dict(SENSOR_FALLBACK); sen.update(w.get("sensor") or {})   # датчик курса стоит не на каждом борту
+    return motors,{n:(s,c) for n,s,c in motors},lights,sen
 SD=C["ships"]; SHIP_DEFAULT=SD["default"]; SHIP_LIST=SD.get("list",[])
 DEFAULT_WIRING=parse_wiring(SHIP_DEFAULT)                       # fallback wiring (address not in list)
 DEFAULT_AIR_RATE=SHIP_DEFAULT["air_rate"]; DEFAULT_POWER=SHIP_DEFAULT["power"]   # shared for all ships
@@ -250,8 +248,9 @@ class Channel(threading.Thread):
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
         self.apply_wiring()               # pick motor/light register map for this ship (by LoRa address)
     def apply_wiring(self):
-        self.motors,self.motor_map,self.lights=wiring_for(self.lora["address"])
+        self.motors,self.motor_map,self.lights,self.sensor=wiring_for(self.lora["address"])
         self.light_map={n:(s,c) for n,s,c in self.lights}
+        self.sensor_fails=0; self.sensor_gone=False   # сменилась разводка/борт -> заново проверяем датчик
 
     # ---- serial / modbus ----
     def open(self):
@@ -492,15 +491,17 @@ class Channel(threading.Thread):
         # Датчик WT901C485: всё сырьё одним блоком (углы он считает сам, интегрировать не нужно).
         # Публикуем широко — для разбора по логам: ускорения, гироскоп, магнитометр, углы, кватернионы.
         # Датчик стоит не на каждом борту -> после SENSOR_GIVEUP неудач замолкаем.
-        if not SENSOR_ON or self.sensor_gone: return True
-        r=self.read_regs(SENSOR_ADDR,3,IMU_BASE,IMU_LEN)
-        if r is None: r=self.read_regs(SENSOR_ADDR,3,IMU_BASE,13)   # откат: без кватернионов (иная прошивка/вариант)
+        sen=getattr(self,"sensor",SENSOR_FALLBACK)
+        if not sen.get("enabled",True) or self.sensor_gone: return True
+        addr=int(sen.get("address",14))
+        r=self.read_regs(addr,3,IMU_BASE,IMU_LEN)
+        if r is None: r=self.read_regs(addr,3,IMU_BASE,13)   # откат: без кватернионов (иная прошивка/вариант)
         if r is None:
             self.sensor_fails+=1
             if self.sensor_fails>=SENSOR_GIVEUP:
                 self.sensor_gone=True
                 for c in IMU_PUB: self.puberr(c,"")
-                print("[%s] датчик (адрес %d) не отвечает %d раз -> опрос выключен для этого борта"%(self.name,SENSOR_ADDR,self.sensor_fails),flush=True)
+                print("[%s] датчик (адрес %d) не отвечает %d раз -> опрос выключен для этого борта"%(self.name,addr,self.sensor_fails),flush=True)
             else:
                 for c in IMU_PUB: self.puberr(c,"r")
             return False
@@ -511,7 +512,7 @@ class Channel(threading.Thread):
             self.pub("gyro_"+ax,round(g(IMU_GYR+i)*GYR_SCALE,2))
             self.pub("mag_"+ax,g(IMU_MAG+i))
         roll=g(IMU_ANG)*ANG_SCALE; pitch=g(IMU_ANG+1)*ANG_SCALE; yaw=g(IMU_ANG+2)*ANG_SCALE
-        if SENSOR_INVERT: yaw=-yaw
+        if sen.get("invert"): yaw=-yaw
         if yaw<=-180: yaw+=360
         elif yaw>180: yaw-=360
         self.pub("roll",round(roll,2)); self.pub("pitch",round(pitch,2)); self.pub("course",round(yaw,1))

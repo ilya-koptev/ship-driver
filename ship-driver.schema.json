@@ -350,37 +350,6 @@
           "options": {
             "collapsed": true
           }
-        },
-        "sensor": {
-          "type": "object",
-          "title": "Датчик курса (WT901C485)",
-          "_format": "grid",
-          "propertyOrder": 35,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "title": "Опрашивать датчик",
-              "default": true,
-              "propertyOrder": 1
-            },
-            "address": {
-              "type": "integer",
-              "title": "Modbus-адрес датчика",
-              "default": 14,
-              "minimum": 1,
-              "maximum": 247,
-              "propertyOrder": 2
-            },
-            "invert": {
-              "type": "boolean",
-              "title": "Инвертировать курс (датчик смонтирован зеркально)",
-              "default": false,
-              "propertyOrder": 3
-            }
-          },
-          "options": {
-            "collapsed": true
-          }
         }
       }
     },
@@ -1372,7 +1341,7 @@
             "lights": {
               "type": "object",
               "title": "Подсветка",
-              "propertyOrder": 4,
+              "propertyOrder": 5,
               "properties": {
                 "nav_lights": {
                   "$ref": "#/definitions/pin",
@@ -1398,6 +1367,37 @@
                   "$ref": "#/definitions/pin",
                   "title": "Cabin light 2",
                   "propertyOrder": 5
+                }
+              },
+              "options": {
+                "collapsed": true
+              }
+            },
+            "sensor": {
+              "type": "object",
+              "title": "Датчик курса (WT901C485)",
+              "_format": "grid",
+              "propertyOrder": 4,
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "title": "Есть на этом борту",
+                  "default": true,
+                  "propertyOrder": 1
+                },
+                "address": {
+                  "type": "integer",
+                  "title": "Modbus-адрес",
+                  "default": 14,
+                  "minimum": 1,
+                  "maximum": 247,
+                  "propertyOrder": 2
+                },
+                "invert": {
+                  "type": "boolean",
+                  "title": "Инвертировать курс (плата смонтирована зеркально)",
+                  "default": false,
+                  "propertyOrder": 3
                 }
               },
               "options": {
@@ -1459,6 +1459,11 @@
                   "slave": 13,
                   "channel": 3
                 }
+              },
+              "sensor": {
+                "enabled": true,
+                "address": 14,
+                "invert": false
               }
             },
             "properties": {
@@ -1682,7 +1687,7 @@
               "lights": {
                 "type": "object",
                 "title": "Подсветка",
-                "propertyOrder": 4,
+                "propertyOrder": 5,
                 "properties": {
                   "nav_lights": {
                     "$ref": "#/definitions/pin",
@@ -1708,6 +1713,37 @@
                     "$ref": "#/definitions/pin",
                     "title": "Cabin light 2",
                     "propertyOrder": 5
+                  }
+                },
+                "options": {
+                  "collapsed": true
+                }
+              },
+              "sensor": {
+                "type": "object",
+                "title": "Датчик курса (WT901C485)",
+                "_format": "grid",
+                "propertyOrder": 4,
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "title": "Есть на этом борту",
+                    "default": true,
+                    "propertyOrder": 1
+                  },
+                  "address": {
+                    "type": "integer",
+                    "title": "Modbus-адрес",
+                    "default": 14,
+                    "minimum": 1,
+                    "maximum": 247,
+                    "propertyOrder": 2
+                  },
+                  "invert": {
+                    "type": "boolean",
+                    "title": "Инвертировать курс (плата смонтирована зеркально)",
+                    "default": false,
+                    "propertyOrder": 3
                   }
                 },
                 "options": {
