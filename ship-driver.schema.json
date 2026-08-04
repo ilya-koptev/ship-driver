@@ -1407,7 +1407,14 @@
           },
           "options": {
             "collapsed": true
-          }
+          },
+          "defaultProperties": [
+            "air_rate",
+            "power",
+            "motors",
+            "sensor",
+            "lights"
+          ]
         },
         "list": {
           "type": "array",
@@ -1759,7 +1766,14 @@
             ],
             "options": {
               "collapsed": true
-            }
+            },
+            "defaultProperties": [
+              "address",
+              "channel",
+              "motors",
+              "sensor",
+              "lights"
+            ]
           },
           "options": {
             "collapsed": true
