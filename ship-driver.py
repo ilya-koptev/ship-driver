@@ -58,7 +58,13 @@ CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
 PWM_SLAVES=[11,12,13]; FREQ_REG={1:0,2:1,3:2}; DUTY_REG={1:112,2:113,3:114}
 ALL_CH=[(s,c) for s in PWM_SLAVES for c in (1,2,3)]
 UPS=10; UPS_VIN=2; UPS_CUR=5; UPS_CHG=8; UPS_TEMP=9; UPS_CHG_SETPOINT=18   # UPS_VIN=2: input voltage (x0.001)
-YAW_REG=0x3F; YAW_SCALE=180.0/32768.0   # WT901C485: рег. 0x3F = угол по оси Z (курс), int16, шкала /32768*180
+# WT901C485 (JY-901): один блок 0x34..0x54 = 33 регистра за ОДНУ транзакцию (~220 мс) —
+# ускорения, гироскоп, магнитометр, углы, температура и кватернионы. Смещения внутри блока:
+IMU_BASE=0x34; IMU_LEN=33
+IMU_ACC=0; IMU_GYR=3; IMU_MAG=6; IMU_ANG=9; IMU_TEMP=12; IMU_Q=29   # 0x51..0x54 -> индекс 29
+ACC_SCALE=16.0/32768.0; GYR_SCALE=2000.0/32768.0; ANG_SCALE=180.0/32768.0; Q_SCALE=1.0/32768.0
+IMU_PUB=["accel_x","accel_y","accel_z","gyro_x","gyro_y","gyro_z","mag_x","mag_y","mag_z",
+         "roll","pitch","course","sensor_temp","q0","q1","q2","q3"]
 # motor/light -> (pwm slave, channel) wiring is loaded from the conf "wiring" section below
 
 SEARCH="SEARCH"; SAIL="SAILING"; CHARGE="CHARGING"; IDLE="IDLE"; SERVICE="SERVICE"; OFF="OFF"
@@ -171,7 +177,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","read_failures","err_timeout","err_frame","retry_fixed","lat_p95","course"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -483,23 +489,37 @@ class Channel(threading.Thread):
         if r is None: self.puberr("charge_level","r"); return False
         self.pub("charge_level",round(r[0]*0.01,1)); self.puberr("charge_level",""); return True
     def poll_course(self):
-        # Курс с датчика WT901C485: угол уже посчитан внутри (акселерометр+гироскоп+магнитометр),
-        # читаем один регистр 0x3F. Датчик есть не на каждом борту -> после SENSOR_GIVEUP неудач замолкаем.
+        # Датчик WT901C485: всё сырьё одним блоком (углы он считает сам, интегрировать не нужно).
+        # Публикуем широко — для разбора по логам: ускорения, гироскоп, магнитометр, углы, кватернионы.
+        # Датчик стоит не на каждом борту -> после SENSOR_GIVEUP неудач замолкаем.
         if not SENSOR_ON or self.sensor_gone: return True
-        r=self.read_regs(SENSOR_ADDR,3,YAW_REG,1)
+        r=self.read_regs(SENSOR_ADDR,3,IMU_BASE,IMU_LEN)
+        if r is None: r=self.read_regs(SENSOR_ADDR,3,IMU_BASE,13)   # откат: без кватернионов (иная прошивка/вариант)
         if r is None:
             self.sensor_fails+=1
             if self.sensor_fails>=SENSOR_GIVEUP:
-                self.sensor_gone=True; self.puberr("course","")
-                print("[%s] датчик курса (адрес %d) не отвечает %d раз -> опрос выключен для этого борта"%(self.name,SENSOR_ADDR,self.sensor_fails),flush=True)
-            else: self.puberr("course","r")
+                self.sensor_gone=True
+                for c in IMU_PUB: self.puberr(c,"")
+                print("[%s] датчик (адрес %d) не отвечает %d раз -> опрос выключен для этого борта"%(self.name,SENSOR_ADDR,self.sensor_fails),flush=True)
+            else:
+                for c in IMU_PUB: self.puberr(c,"r")
             return False
         self.sensor_fails=0
-        yaw=s16(r[0])*YAW_SCALE
+        g=lambda i: s16(r[i])
+        for i,ax in enumerate("xyz"):
+            self.pub("accel_"+ax,round(g(IMU_ACC+i)*ACC_SCALE,3))
+            self.pub("gyro_"+ax,round(g(IMU_GYR+i)*GYR_SCALE,2))
+            self.pub("mag_"+ax,g(IMU_MAG+i))
+        roll=g(IMU_ANG)*ANG_SCALE; pitch=g(IMU_ANG+1)*ANG_SCALE; yaw=g(IMU_ANG+2)*ANG_SCALE
         if SENSOR_INVERT: yaw=-yaw
         if yaw<=-180: yaw+=360
         elif yaw>180: yaw-=360
-        self.pub("course",round(yaw,1)); self.puberr("course",""); return True
+        self.pub("roll",round(roll,2)); self.pub("pitch",round(pitch,2)); self.pub("course",round(yaw,1))
+        if len(r)>IMU_TEMP: self.pub("sensor_temp",round(g(IMU_TEMP)*0.01,1))
+        if len(r)>=IMU_Q+4:
+            for i in range(4): self.pub("q%d"%i,round(g(IMU_Q+i)*Q_SCALE,4))
+        for c in IMU_PUB: self.puberr(c,"")
+        return True
     def poll_pwm_readback(self):
         # read-back of all motors+lights via ONE block per pwm8a04 (regs 112..114 = ch1/2/3), then distribute
         ok=True; block={}
@@ -768,7 +788,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
