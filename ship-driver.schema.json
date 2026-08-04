@@ -1414,6 +1414,13 @@
             "motors",
             "sensor",
             "lights"
+          ],
+          "required": [
+            "air_rate",
+            "power",
+            "motors",
+            "sensor",
+            "lights"
           ]
         },
         "list": {
@@ -1762,6 +1769,7 @@
               "address",
               "channel",
               "motors",
+              "sensor",
               "lights"
             ],
             "options": {
