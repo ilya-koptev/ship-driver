@@ -58,6 +58,7 @@ CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
 PWM_SLAVES=[11,12,13]; FREQ_REG={1:0,2:1,3:2}; DUTY_REG={1:112,2:113,3:114}
 ALL_CH=[(s,c) for s in PWM_SLAVES for c in (1,2,3)]
 UPS=10; UPS_VIN=2; UPS_CUR=5; UPS_CHG=8; UPS_TEMP=9; UPS_CHG_SETPOINT=18   # UPS_VIN=2: input voltage (x0.001)
+YAW_REG=0x3F; YAW_SCALE=180.0/32768.0   # WT901C485: рег. 0x3F = угол по оси Z (курс), int16, шкала /32768*180
 # motor/light -> (pwm slave, channel) wiring is loaded from the conf "wiring" section below
 
 SEARCH="SEARCH"; SAIL="SAILING"; CHARGE="CHARGING"; IDLE="IDLE"; SERVICE="SERVICE"; OFF="OFF"
@@ -69,10 +70,13 @@ DEFAULTS={
  "charge":{"full_ma":2000},   # ток заряда; тепловая защита заряда — в самом WB-UPS-v3 (>+50 °C), драйвер её не дублирует
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
+ # Датчик курса (WitMotion WT901C485/JY-901 на бортовой шине). Отдаёт уже посчитанный угол —
+ # интегрировать ничего не нужно. Выводим только курс (yaw, рег. 0x3F); крен/дифферент не нужны.
+ "sensor":{"enabled":True,"address":14,"invert":False},
  "rates":{
-   "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10},
-   "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10},
-   "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":10},
+   "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10,"course":10},
+   "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10,"course":1},
+   "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":10,"course":10},
    "sail_timeout_s":30.0, "offline_fails":2, "read_tries":2, "tx_gap_ms":0,
    "search_period":0.05, "service_period":1.0},
  "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
@@ -119,6 +123,8 @@ MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardco
 RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
+_S=M.get("sensor",{}) ; SENSOR_ON=bool(_S.get("enabled",True)); SENSOR_ADDR=int(_S.get("address",14)); SENSOR_INVERT=bool(_S.get("invert",False))
+SENSOR_GIVEUP=3   # столько неудач подряд -> считаем, что на этом борту датчика нет, и перестаём его дёргать
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
 COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
@@ -165,7 +171,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","read_failures","err_timeout","err_frame","retry_fixed","lat_p95","course"]+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -232,6 +238,7 @@ class Channel(threading.Thread):
         # значит первый выход на связь = полный init_ship. Иначе resume_ship записал бы нули как «желаемый» газ.
         self.force_init=True                # также ставится при осознанной смене корабля
         self.f16=None                       # поддержка Modbus func16 (блочная запись): None=не пробовали, True/False=выяснено
+        self.sensor_fails=0; self.sensor_gone=False   # датчик курса стоит не на всех бортах -> после N неудач перестаём опрашивать
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
@@ -401,6 +408,7 @@ class Channel(threading.Thread):
 
     # ---- ship logic ----
     def init_ship(self):
+        self.sensor_fails=0; self.sensor_gone=False   # новый борт -> заново проверяем наличие датчика курса
         print("[%s] init_ship ship=%d: freq=%d, motors->idle(%d), lights->%d"%(self.name,self.lora["address"],INIT_FREQ,INIT_MOTOR,INIT_LIGHT),flush=True)
         # Блочно (func16): по одному кадру на модуль вместо трёх — было 18 транзакций на инициализацию, стало 6.
         for s in PWM_SLAVES: self.write_regs(s,DUTY_REG[1],[0,0,0])             # 1) power (duty) off on every channel first
@@ -474,6 +482,24 @@ class Channel(threading.Thread):
         r=self.read_regs(UPS,4,UPS_CHG,1)
         if r is None: self.puberr("charge_level","r"); return False
         self.pub("charge_level",round(r[0]*0.01,1)); self.puberr("charge_level",""); return True
+    def poll_course(self):
+        # Курс с датчика WT901C485: угол уже посчитан внутри (акселерометр+гироскоп+магнитометр),
+        # читаем один регистр 0x3F. Датчик есть не на каждом борту -> после SENSOR_GIVEUP неудач замолкаем.
+        if not SENSOR_ON or self.sensor_gone: return True
+        r=self.read_regs(SENSOR_ADDR,3,YAW_REG,1)
+        if r is None:
+            self.sensor_fails+=1
+            if self.sensor_fails>=SENSOR_GIVEUP:
+                self.sensor_gone=True; self.puberr("course","")
+                print("[%s] датчик курса (адрес %d) не отвечает %d раз -> опрос выключен для этого борта"%(self.name,SENSOR_ADDR,self.sensor_fails),flush=True)
+            else: self.puberr("course","r")
+            return False
+        self.sensor_fails=0
+        yaw=s16(r[0])*YAW_SCALE
+        if SENSOR_INVERT: yaw=-yaw
+        if yaw<=-180: yaw+=360
+        elif yaw>180: yaw-=360
+        self.pub("course",round(yaw,1)); self.puberr("course",""); return True
     def poll_pwm_readback(self):
         # read-back of all motors+lights via ONE block per pwm8a04 (regs 112..114 = ch1/2/3), then distribute
         ok=True; block={}
@@ -499,7 +525,7 @@ class Channel(threading.Thread):
                     self.online=False; self.fails=0; self.due={}   # -> run(): SEARCH -> init_ship переармит ESC и вернёт холостой
                     return True
         return True
-    GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check"}
+    GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check","course":"poll_course"}
     def decide(self):
         if not self.online: return SEARCH
         if any(v>INIT_MOTOR for v in self.motor.values()): return SAIL   # держим SAILING, пока хоть один мотор выше холостого
@@ -742,7 +768,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})

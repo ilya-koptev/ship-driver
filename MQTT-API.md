@@ -55,6 +55,7 @@ mosquitto_sub -h 192.168.69.105 -t '/devices/boat4/controls/mode' -C 1
 | `err_timeout` | `/devices/boat4/controls/err_timeout` | ro | отказов «не пришло ни байта» за 5 мин |
 | `err_frame` | `/devices/boat4/controls/err_frame` | ro | отказов «обрывок / чужой кадр / битый CRC» за 5 мин |
 | `retry_fixed` | `/devices/boat4/controls/retry_fixed` | ro | промахов, вылеченных повтором, за 5 мин |
+| `course` | `/devices/boat4/controls/course` | ro | ° · курс борта (−180…180) с датчика WT901C485; публикуется только если датчик есть на этом борту |
 | `lat_p95` | `/devices/boat4/controls/lat_p95` | ro | мс · латентность чтения, 95‑й перцентиль |
 | `back_left` / `front_left` / `back_right` / `front_right` | `/devices/boat4/controls/{name}` | rw | `40–80` (40 = холостой ход) |
 | `nav_lights` / `morse_lamp` / `deck_lights` / `cabin_light1` / `cabin_light2` | `/devices/boat4/controls/{name}` | rw | `0–100` % |

@@ -79,6 +79,12 @@
           "title": "Проверка частоты ШИМ",
           "minimum": 1,
           "propertyOrder": 5
+        },
+        "course": {
+          "type": "integer",
+          "title": "Курс (датчик), с",
+          "minimum": 1,
+          "propertyOrder": 6
         }
       },
       "required": [
@@ -339,6 +345,37 @@
               "title": "MOD4",
               "_format": "checkbox",
               "propertyOrder": 4
+            }
+          },
+          "options": {
+            "collapsed": true
+          }
+        },
+        "sensor": {
+          "type": "object",
+          "title": "Датчик курса (WT901C485)",
+          "_format": "grid",
+          "propertyOrder": 35,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "title": "Опрашивать датчик",
+              "default": true,
+              "propertyOrder": 1
+            },
+            "address": {
+              "type": "integer",
+              "title": "Modbus-адрес датчика",
+              "default": 14,
+              "minimum": 1,
+              "maximum": 247,
+              "propertyOrder": 2
+            },
+            "invert": {
+              "type": "boolean",
+              "title": "Инвертировать курс (датчик смонтирован зеркально)",
+              "default": false,
+              "propertyOrder": 3
             }
           },
           "options": {
@@ -1384,17 +1421,44 @@
               "address": 1,
               "channel": 16,
               "motors": {
-                "back_left": { "slave": 12, "channel": 1 },
-                "front_left": { "slave": 12, "channel": 2 },
-                "back_right": { "slave": 11, "channel": 1 },
-                "front_right": { "slave": 11, "channel": 2 }
+                "back_left": {
+                  "slave": 12,
+                  "channel": 1
+                },
+                "front_left": {
+                  "slave": 12,
+                  "channel": 2
+                },
+                "back_right": {
+                  "slave": 11,
+                  "channel": 1
+                },
+                "front_right": {
+                  "slave": 11,
+                  "channel": 2
+                }
               },
               "lights": {
-                "nav_lights": { "slave": 11, "channel": 3 },
-                "morse_lamp": { "slave": 12, "channel": 3 },
-                "deck_lights": { "slave": 13, "channel": 1 },
-                "cabin_light1": { "slave": 13, "channel": 2 },
-                "cabin_light2": { "slave": 13, "channel": 3 }
+                "nav_lights": {
+                  "slave": 11,
+                  "channel": 3
+                },
+                "morse_lamp": {
+                  "slave": 12,
+                  "channel": 3
+                },
+                "deck_lights": {
+                  "slave": 13,
+                  "channel": 1
+                },
+                "cabin_light1": {
+                  "slave": 13,
+                  "channel": 2
+                },
+                "cabin_light2": {
+                  "slave": 13,
+                  "channel": 3
+                }
               }
             },
             "properties": {
@@ -1676,63 +1740,77 @@
       "title": "Зарядки",
       "propertyOrder": 4,
       "items": {
+        "type": "object",
+        "title": "Зарядка",
+        "headerTemplate": "Charger {{i1}}",
+        "properties": {
+          "gateway": {
+            "type": "string",
+            "title": "Шлюз Modbus-TCP (host:port)",
+            "propertyOrder": 1
+          },
+          "transmitter": {
+            "$ref": "#/definitions/relayout",
+            "title": "Передатчик (реле)",
+            "propertyOrder": 2
+          },
+          "magnets": {
+            "$ref": "#/definitions/relayout",
+            "title": "Магниты фиксации (реле)",
+            "propertyOrder": 3
+          },
+          "sensor": {
             "type": "object",
-            "title": "Зарядка",
-            "headerTemplate": "Charger {{i1}}",
+            "title": "Датчик тока (WB-MAI6)",
+            "_format": "grid",
+            "propertyOrder": 4,
             "properties": {
-              "gateway": {
-                "type": "string",
-                "title": "Шлюз Modbus-TCP (host:port)",
+              "address": {
+                "type": "integer",
+                "title": "Modbus адрес",
+                "minimum": 1,
+                "maximum": 247,
                 "propertyOrder": 1
               },
-              "transmitter": {
-                "$ref": "#/definitions/relayout",
-                "title": "Передатчик (реле)",
+              "input": {
+                "type": "integer",
+                "title": "Вход IN",
+                "enum": [
+                  1,
+                  2,
+                  3,
+                  4,
+                  5,
+                  6
+                ],
                 "propertyOrder": 2
               },
-              "magnets": {
-                "$ref": "#/definitions/relayout",
-                "title": "Магниты фиксации (реле)",
+              "shunt_ohm": {
+                "type": "number",
+                "title": "Шунт, Ом",
+                "minimum": 0.001,
+                "default": 1.2,
                 "propertyOrder": 3
-              },
-              "sensor": {
-                "type": "object",
-                "title": "Датчик тока (WB-MAI6)",
-                "_format": "grid",
-                "propertyOrder": 4,
-                "properties": {
-                  "address": {
-                    "type": "integer",
-                    "title": "Modbus адрес",
-                    "minimum": 1,
-                    "maximum": 247,
-                    "propertyOrder": 1
-                  },
-                  "input": {
-                    "type": "integer",
-                    "title": "Вход IN",
-                    "enum": [1, 2, 3, 4, 5, 6],
-                    "propertyOrder": 2
-                  },
-                  "shunt_ohm": {
-                    "type": "number",
-                    "title": "Шунт, Ом",
-                    "minimum": 0.001,
-                    "default": 1.2,
-                    "propertyOrder": 3
-                  }
-                },
-                "required": ["address", "input", "shunt_ohm"],
-                "options": {
-                  "collapsed": true
-                }
               }
             },
-            "required": ["transmitter", "sensor"],
+            "required": [
+              "address",
+              "input",
+              "shunt_ohm"
+            ],
             "options": {
               "collapsed": true
             }
-          },
+          }
+        },
+        "required": [
+          "transmitter",
+          "sensor"
+        ],
+        "options": {
+          "collapsed": true
+        }
+      },
       "options": {
         "collapsed": true
       }
