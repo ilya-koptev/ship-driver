@@ -1,0 +1,15 @@
+[Unit]
+Description=Ship-bus LoRa driver (Wiren Board)
+After=mosquitto.service
+Wants=mosquitto.service
+Conflicts=wb-mqtt-serial.service
+
+[Service]
+Type=simple
+ExecStartPre=-/bin/systemctl stop wb-mqtt-serial.service
+ExecStart=/usr/bin/python3 /usr/bin/ship-driver.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
