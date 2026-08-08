@@ -145,6 +145,7 @@ mosquitto_pub -h 192.168.69.105 \
 | `transmitter` | `/devices/chargerN/controls/transmitter` | rw | `0`/`1` — передатчик XKT-801 |
 | `magnets` | `/devices/chargerN/controls/magnets` | rw | `0`/`1` — магниты фиксации |
 | `transmitter_current` | `/devices/chargerN/controls/transmitter_current` | ro | ток передатчика, А (WB-MAI6 = падение на шунте / сопротивление) |
+| `charge_link` | `/devices/chargerN/controls/charge_link` | ro | % · сколько из запрошенного тока доходит до батареи (факт / уставка). 100 = борт берёт всё, что просим; меньше — потери на посадке катушек. Помечается «нет данных», если передатчик выключен или никто не заряжается; при почти полной батарее (Vbat ≥ 8.05 В) всегда 100 — там ток режет сам заряд |
 
 ```bash
 # включить передатчик и магниты на станции 1

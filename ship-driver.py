@@ -176,7 +176,7 @@ CHG_PERIOD=3.0            # charger bus poll period, s
 MAI_VOLT_SCALE=1e-6       # WB-MAI6 input-voltage raw (s32) -> volts
 MAI_IN0=0x0700           # WB-MAI6 fw2.4: IN n voltage input reg = MAI_IN0 + 2*(n-1), s32
 MRM_COIL0=0; MRM_STATE0=96   # WB-MRM2-mini: K ch -> coil (ch-1); real contact state -> discrete 96+(ch-1)
-CHARGER_CONTROLS=["transmitter","magnets","transmitter_current"]
+CHARGER_CONTROLS=["transmitter","magnets","transmitter_current","charge_link"]
 # control set is the SAME on every ship -> names/count fixed (from default), only the register mapping varies per ship
 MOTOR_NAMES=[n for n,_,_ in DEFAULT_WIRING[0]]
 LIGHT_NAMES=[n for n,_,_ in DEFAULT_WIRING[2]]
@@ -500,6 +500,7 @@ class Channel(threading.Thread):
         self.pub_comms()   # счётчики связи обновляем каждым опросом (учитывают и этот промах, если был)
         if r is None: self.puberr("battery_current","r"); self.puberr("battery_voltage","r"); self.puberr("input_voltage","r"); return False
         self.tele["current"]=s16(r[3])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current","")
+        self.tele["vbat"]=r[2]*0.001; self.tele["vin"]=r[0]*0.001   # нужны станции для индикатора связи катушек
         self.pub("battery_voltage",round(r[2]*0.001,2)); self.puberr("battery_voltage","")   # Vbat (АКБ, ~8 В) — рядом с зарядом
         self.pub("input_voltage",round(r[0]*0.001,2)); self.puberr("input_voltage","")
         if self.rssi is not None: self.pub("rssi",self.rssi); self.puberr("rssi","")   # обновлён чтением выше
@@ -755,6 +756,20 @@ class ChargerBus(threading.Thread):
         r=bus.read_input(int(s["address"]),reg,2)
         if r is None: return None
         return s32(r[0],r[1])*MAI_VOLT_SCALE/float(s.get("shunt_ohm",1.2))
+    def link_pct(self):
+        # Индикатор качества связи катушек: сколько ИЗ ЗАПРОШЕННОГО тока реально доходит до батареи.
+        # Драйвер сам задаёт уставку (регистр 18), поэтому «факт / уставка» — прямая мера передачи:
+        # 100 % = борт берёт всё, что просим; меньше — энергия теряется на плохой посадке.
+        # Возвращает (проценты, пояснение) или (None, причина), если мерить нечего.
+        for ch in self.drv.channels.values():
+            if ch.mode!=CHARGE or ch.tele.get("vin",0)<=5: continue      # борт не на паду / не заряжается
+            sp=float(ch.chg_setpoint or 0); i_ma=ch.tele.get("current",0.0)*1000.0
+            if sp<=0: return None,"нет уставки"
+            if ch.tele.get("vbat",0)>=8.05:                              # батарея почти полная: недобор нормален,
+                return 100,"батарея полная"                              # ограничивает не связь, а сам заряд
+            if i_ma<=0: return 0,"тока нет"
+            return max(0,min(100,int(round(100.0*i_ma/sp)))),""
+        return None,"нет заряжающегося борта"
     def handle(self,dev,ctrl,val):
         on=(val in ("1","true","on"))
         for i,ch in enumerate(self.chargers):
@@ -776,12 +791,19 @@ class ChargerBus(threading.Thread):
                     cur=self.read_current(ch)
                     if cur is None: self.puberr(dev,"transmitter_current","r")
                     else: self.pub(dev,"transmitter_current",round(cur,3)); self.puberr(dev,"transmitter_current","")
+                    tx_on=None
                     for ctrl in ("transmitter","magnets"):
                         out=ch.get(ctrl)
                         if not out: continue
                         st=self.relay_state(ch,out)
                         if st is None: self.puberr(dev,ctrl,"r")
-                        else: self.pub(dev,ctrl,1 if st else 0); self.puberr(dev,ctrl,"")
+                        else:
+                            self.pub(dev,ctrl,1 if st else 0); self.puberr(dev,ctrl,"")
+                            if ctrl=="transmitter": tx_on=st
+                    # связь катушек: считаем только когда этот передатчик включён и на нём кто-то заряжается
+                    pct,why=self.link_pct() if tx_on else (None,"передатчик выключен")
+                    if pct is None: self.puberr(dev,"charge_link","r")
+                    else: self.pub(dev,"charge_link",pct); self.puberr(dev,"charge_link","")
                 except Exception as e:
                     print("[chg] poll err %s %s"%(dev,e),flush=True)
                     b=self.bus_for(ch)
@@ -906,6 +928,7 @@ class Driver:
                 cctl("transmitter",{"type":"switch","readonly":False,"title":"Transmitter"})
                 cctl("magnets",{"type":"switch","readonly":False,"title":"Hold magnets"})
                 cctl("transmitter_current",{"type":"value","readonly":True,"units":"A","title":"Transmitter current"})
+                cctl("charge_link",{"type":"value","readonly":True,"units":"%","title":"Coupling (charge vs setpoint)"})
                 self.mqtt.subscribe("/devices/%s/controls/+/on"%cd)
         # remove dashboards of absent modules (clear retained topics)
         for dev in getattr(self,"absent",[]):
