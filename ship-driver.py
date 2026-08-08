@@ -9,7 +9,7 @@
 # boatN MQTT device = operational API + visualisation (driven by external software); LoRa config
 # lives in the conf, only LoRa_address is live on boatN (writes the modem immediately, applying the
 # conf channel/air/power + the new address). Wired ship pre-config stays on the "Ship Setup" dashboard.
-import time, threading, queue, json, os, re, signal, socket
+import time, threading, queue, json, os, re, signal, socket, math
 import serial
 import paho.mqtt.client as mqtt
 
@@ -175,7 +175,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -463,9 +463,25 @@ class Channel(threading.Thread):
         self.pub("err_timeout",len(self._rd_kind["to"]))                                    # «радийная» подпись
         self.pub("err_frame",len(self._rd_kind["short"])+len(self._rd_kind["hdr"])+len(self._rd_kind["crc"]))  # фрейминг/тайминги/искажение
         self.pub("retry_fixed",len(self._rd_retry_ok))
+        lat=None
         if self._lat:
             v=sorted(x for _,x in self._lat)
-            self.pub("lat_p95",round(v[min(len(v)-1,int(0.95*len(v)))],0))
+            lat=round(v[min(len(v)-1,int(0.95*len(v)))],0)
+            self.pub("lat_p95",lat)
+        self.pub_link_score(errs,att,len(self._rd_fail),lat)
+    def pub_link_score(self,errs,att,fails,lat):
+        # Единый индекс качества связи 0..100 из четырёх сырых показателей.
+        # Пороги — из измеренной нормы: RSSI ~-53, link_quality ~96.6 %, read_failures 0, lat_p95 ~117 мс.
+        cl=lambda x: max(0.0,min(100.0,x))
+        q_fail=100.0*math.exp(-fails/3.0)                       # реальная потеря данных: 1->72, 2->51, 5->19
+        q_loss=cl((100.0*(1-errs/att)-80.0)/20.0*100.0) if att else 100.0   # 100%->100, 95->75, 90->50, <=80->0
+        parts=[(q_fail,0.45),(q_loss,0.25)]
+        if self.rssi is not None: parts.append((cl((self.rssi+100.0)/50.0*100.0),0.20))   # -50->100, -75->60, -90->25
+        if lat is not None:       parts.append((cl(100.0-(lat-100.0)/5.0),0.10))          # 100мс->100, 200->70, 400->20
+        w=sum(x[1] for x in parts)
+        score=sum(v*k for v,k in parts)/w if w else 100.0
+        score=min(score,q_fail+20.0)   # реальные провалы всегда тянут вниз, даже при отличном сигнале
+        self.pub("link_score",int(round(cl(score))))
     def poll_current(self):
         r=self.read_regs(UPS,4,UPS_VIN,4)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat (input voltage rides along at the 5 s current rate)
         self.pub_comms()   # счётчики связи обновляем каждым опросом (учитывают и этот промах, если был)
@@ -789,7 +805,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("link_score","","Link score (0-100)"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})

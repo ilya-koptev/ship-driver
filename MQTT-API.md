@@ -51,6 +51,7 @@ mosquitto_sub -h 192.168.69.105 -t '/devices/boat4/controls/mode' -C 1
 | `rssi` | `/devices/boat4/controls/rssi` | ro | дБм · RSSI LoRa‑линка активного борта (E220 packet‑byte) |
 | `comms_errors` | `/devices/boat4/controls/comms_errors` | ro | сырых промахов чтения за скользящие 5 мин |
 | `link_quality` | `/devices/boat4/controls/link_quality` | ro | % успешных чтений за 5 мин (100 = идеал) |
+| `link_score` | `/devices/boat4/controls/link_score` | ro | 0…100 · общая оценка связи: свёртка `read_failures` (вес 0.45), `link_quality` (0.25), `rssi` (0.20), `lat_p95` (0.10); сверху ограничена «оценкой потерь + 20», чтобы реальные потери всегда тянули вниз. ≥90 отлично, 75–90 хорошо, 50–75 слабо, <50 плохо |
 | `read_failures` | `/devices/boat4/controls/read_failures` | ro | отказов чтения **после всех повторов** за 5 мин = реально потерянные данные |
 | `err_timeout` | `/devices/boat4/controls/err_timeout` | ro | отказов «не пришло ни байта» за 5 мин |
 | `err_frame` | `/devices/boat4/controls/err_frame` | ro | отказов «обрывок / чужой кадр / битый CRC» за 5 мин |
