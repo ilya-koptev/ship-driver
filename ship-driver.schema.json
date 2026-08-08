@@ -173,9 +173,73 @@
           "properties": {
             "full_ma": {
               "type": "integer",
-              "title": "Ток заряда, мА",
-              "minimum": 0,
+              "title": "Ток заряда (максимум), мА",
+              "minimum": 300,
+              "maximum": 2000,
+              "default": 2000,
               "propertyOrder": 1
+            },
+            "thermal": {
+              "type": "object",
+              "title": "Тепловой регулятор заряда",
+              "_format": "grid",
+              "propertyOrder": 2,
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "title": "Включён",
+                  "_format": "checkbox",
+                  "default": true,
+                  "propertyOrder": 1
+                },
+                "t_target_c": {
+                  "type": "number",
+                  "title": "Целевая температура, °C",
+                  "default": 48,
+                  "propertyOrder": 2
+                },
+                "min_ma": {
+                  "type": "integer",
+                  "title": "Минимальный ток, мА",
+                  "minimum": 300,
+                  "maximum": 2000,
+                  "default": 300,
+                  "propertyOrder": 3
+                },
+                "kp_ma_per_c": {
+                  "type": "number",
+                  "title": "Kp, мА на °C",
+                  "default": 400,
+                  "propertyOrder": 4
+                },
+                "ki_ma_per_c_s": {
+                  "type": "number",
+                  "title": "Ki, мА на °C·с",
+                  "default": 3,
+                  "propertyOrder": 5
+                },
+                "lead_min": {
+                  "type": "number",
+                  "title": "Горизонт прогноза, мин",
+                  "default": 5,
+                  "propertyOrder": 6
+                },
+                "deadband_ma": {
+                  "type": "integer",
+                  "title": "Порог записи, мА",
+                  "default": 40,
+                  "propertyOrder": 7
+                },
+                "min_write_s": {
+                  "type": "number",
+                  "title": "Не чаще, с",
+                  "default": 20,
+                  "propertyOrder": 8
+                }
+              },
+              "options": {
+                "collapsed": true
+              }
             }
           },
           "options": {

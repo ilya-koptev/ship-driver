@@ -73,7 +73,12 @@ SEARCH="SEARCH"; SAIL="SAILING"; CHARGE="CHARGING"; IDLE="IDLE"; SERVICE="SERVIC
 DEFAULTS={
  "main":{
  "baud":9600, "resp_timeout_s":0.8,
- "charge":{"full_ma":2000},   # ток заряда; тепловая защита заряда — в самом WB-UPS-v3 (>+50 °C), драйвер её не дублирует
+ # Ток заряда. Аппаратная защита УПС рвёт заряд при +50 °C, после чего он идёт рывками — поэтому
+ # драйвер сам держит температуру чуть ниже порога и при этом выжимает максимально возможный ток.
+ "charge":{"full_ma":2000,
+           "thermal":{"enabled":True,"t_target_c":48.0,"min_ma":300,
+                      "kp_ma_per_c":400.0,"ki_ma_per_c_s":3.0,"lead_min":5.0,
+                      "deadband_ma":40,"min_write_s":20}},
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
  "rates":{
@@ -119,7 +124,12 @@ C=load_conf()
 
 M=C["main"]
 BAUD=M["baud"]; RESP_TO=M["resp_timeout_s"]
-CHG_FULL=M["charge"]["full_ma"]   # ток заряда; тепловую защиту (отсечка >+50 °C) делает сам WB-UPS-v3, драйверный thermal убран
+CHG_FULL=M["charge"]["full_ma"]   # верхний предел тока заряда (регистр 18 УПС принимает 300..2000 мА)
+_TH=M["charge"].get("thermal",{})
+THERM_ON=bool(_TH.get("enabled",True)); T_TARGET=float(_TH.get("t_target_c",48.0))
+CHG_MIN=int(_TH.get("min_ma",300)); TH_KP=float(_TH.get("kp_ma_per_c",400.0))
+TH_KI=float(_TH.get("ki_ma_per_c_s",3.0)); TH_LEAD=float(_TH.get("lead_min",5.0))
+TH_DEAD=int(_TH.get("deadband_ma",40)); TH_WRITE_S=float(_TH.get("min_write_s",20))
 INIT_FREQ=M["init"]["freq"]; INIT_MOTOR=M["init"]["motor"]; INIT_LIGHT=M["init"]["light"]
 MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]
 MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardcoded
@@ -175,7 +185,7 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","charge_setpoint","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -233,6 +243,7 @@ class Channel(threading.Thread):
         self.declared_full=False   # whether the full control set is currently published (vs collapsed to enabled+mode)
         self.last_cmd=0.0; self.lora_read=False
         self.chg_setpoint=CHG_FULL; self.tele={}; self.rssi=None   # RSSI линка (дБм), из хвостового байта каждого ответа борта
+        self._th_i=0.0; self._th_win=[]; self._th_w=0.0            # состояние теплового ПИД-регулятора заряда
         self._rd_att=[]; self._rd_miss=[]   # тайминги попыток/промахов чтения за скользящее окно (сырое качество линка)
         self._rd_fail=[]                    # отказы ПОСЛЕ всех ретраев — «настоящие» ошибки, видимые оператору
         self._rd_kind={"to":[],"short":[],"crc":[],"hdr":[]}   # подписи отказа: to=ничего не пришло (похоже на радио), остальные=фрейминг/тайминги
@@ -500,7 +511,37 @@ class Channel(threading.Thread):
     def poll_temp(self):
         r=self.read_regs(UPS,4,UPS_TEMP,1)
         if r is None: self.puberr("battery_temperature","r"); return False
-        self.tele["temp"]=s16(r[0])*0.01; self.pub("battery_temperature",round(self.tele["temp"],2)); self.puberr("battery_temperature",""); return True
+        self.tele["temp"]=s16(r[0])*0.01; self.pub("battery_temperature",round(self.tele["temp"],2)); self.puberr("battery_temperature","")
+        if THERM_ON and self.mode==CHARGE: self.thermal_pid(self.tele["temp"])
+        return True
+    def thermal_pid(self,t):
+        # Держим температуру батареи у T_TARGET и при этом выжимаем максимально возможный ток заряда.
+        # Зачем: аппаратная защита УПС рвёт заряд при +50 °C, после чего он идёт рывками и греет впустую.
+        # Процесс инерционный, поэтому регулируем по ПРЕДСКАЗАННОЙ температуре: t + скорость_роста * TH_LEAD.
+        # Это тот же D-член, но в понятном виде — «где будем через TH_LEAD минут». Чистого D по шуму нет.
+        now=time.monotonic()
+        self._th_win.append((now,t)); self._th_win=[(x,y) for x,y in self._th_win if now-x<=60.0]
+        slope=0.0
+        if len(self._th_win)>1:
+            dt=(self._th_win[-1][0]-self._th_win[0][0])/60.0
+            if dt>0: slope=(self._th_win[-1][1]-self._th_win[0][1])/dt     # °C/мин
+        e=T_TARGET-(t+slope*TH_LEAD)
+        if t>=T_TARGET+1.0:                       # вплотную к отсечке — сразу в минимум, интеграл сбрасываем
+            self._th_i=0.0; out=CHG_MIN
+        else:
+            sat=(self.chg_setpoint>=CHG_FULL and e>0) or (self.chg_setpoint<=CHG_MIN and e<0)
+            if not sat:                            # анти-виндап: в насыщении не копим
+                step=now-getattr(self,"_th_t",now)
+                self._th_i=max(0.0,min(float(CHG_FULL),self._th_i+TH_KI*e*min(step,60.0)))
+            out=TH_KP*e+self._th_i
+        self._th_t=now
+        out=int(max(CHG_MIN,min(CHG_FULL,out)))
+        # регистр 18 — настроечный, пишем редко: только заметное изменение и не чаще TH_WRITE_S
+        if abs(out-self.chg_setpoint)>=TH_DEAD and now-self._th_w>=TH_WRITE_S:
+            self._th_w=now
+            if self.write_reg(UPS,UPS_CHG_SETPOINT,out):
+                self.chg_setpoint=out; self.pub("charge_setpoint",out)
+                print("[%s] заряд: t=%.1f °C (прогноз %.1f, %+.2f °C/мин) -> ток %d мА"%(self.name,t,t+slope*TH_LEAD,slope,out),flush=True)
     def poll_charge(self):
         r=self.read_regs(UPS,4,UPS_CHG,1)
         if r is None: self.puberr("charge_level","r"); return False
@@ -575,8 +616,10 @@ class Channel(threading.Thread):
             self.mode=m; self.pub("mode",m)
             want_full=(m not in (SEARCH,OFF))   # polling -> show full dashboard; not polling -> only enabled+mode
             if want_full!=self.declared_full: self.drv.boat_controls(self,want_full)
-            if m==CHARGE:
+            if m==CHARGE:   # входим в заряд с полного тока; регулятор сам снизит по мере нагрева
                 self.chg_setpoint=CHG_FULL; self.write_reg(UPS,UPS_CHG_SETPOINT,CHG_FULL)
+                self.pub("charge_setpoint",CHG_FULL)
+                self._th_i=float(CHG_FULL); self._th_win=[]; self._th_w=0.0; self._th_t=time.monotonic()
             if m==OFF: gpio_set(self.gpio,1)   # disabled -> put MOD modem into config mode (off-air)
 
     def run(self):
@@ -807,7 +850,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("link_score","","Link score (0-100)"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3")):
+            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("link_score","","Link score (0-100)"),("charge_setpoint","mA","Charge current setpoint"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3")):
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
