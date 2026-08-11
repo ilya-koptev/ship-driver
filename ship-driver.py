@@ -78,7 +78,9 @@ DEFAULTS={
  "charge":{"full_ma":2000,
            "thermal":{"enabled":True,"t_target_c":48.0,"min_ma":300,
                       "kp_ma_per_c":400.0,"ki_ma_per_c_s":3.0,"lead_min":5.0,
-                      "deadband_ma":40,"min_write_s":20}},
+                      "deadband_ma":40,"min_write_s":20},
+           # индикатор посадки катушек: ожидаемое Vin = v_open - r_eff*Ibat; недобор dev_full_v = 0 %
+           "link":{"v_open_v":12.7,"r_eff_ohm":0.35,"dev_full_v":2.0,"smooth":5}},
  "init":{"freq":400,"motor":40,"light":0},
  "limits":{"motor_min":40,"motor_max":80,"mp3_track_max":15},
  "rates":{
@@ -130,6 +132,9 @@ THERM_ON=bool(_TH.get("enabled",True)); T_TARGET=float(_TH.get("t_target_c",48.0
 CHG_MIN=int(_TH.get("min_ma",300)); TH_KP=float(_TH.get("kp_ma_per_c",400.0))
 TH_KI=float(_TH.get("ki_ma_per_c_s",3.0)); TH_LEAD=float(_TH.get("lead_min",5.0))
 TH_DEAD=int(_TH.get("deadband_ma",40)); TH_WRITE_S=float(_TH.get("min_write_s",20))
+_LK=M["charge"].get("link",{})
+LK_VOPEN=float(_LK.get("v_open_v",12.7)); LK_REFF=float(_LK.get("r_eff_ohm",0.35))
+LK_DEVFULL=float(_LK.get("dev_full_v",2.0)); LK_SMOOTH=int(_LK.get("smooth",5))
 INIT_FREQ=M["init"]["freq"]; INIT_MOTOR=M["init"]["motor"]; INIT_LIGHT=M["init"]["light"]
 MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]
 MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardcoded
@@ -725,6 +730,7 @@ class ChargerBus(threading.Thread):
     def __init__(self,drv,chargers):
         super().__init__(daemon=True)
         self.drv=drv; self.chargers=chargers; self.q=queue.Queue()
+        self._lk=[]   # окно сглаживания индикатора посадки
         self.buses={}   # gateway str -> ModbusTCP
     def dev(self,i): return "charger%d"%(i+1)
     def bus_for(self,ch):
@@ -757,19 +763,22 @@ class ChargerBus(threading.Thread):
         if r is None: return None
         return s32(r[0],r[1])*MAI_VOLT_SCALE/float(s.get("shunt_ohm",1.2))
     def link_pct(self):
-        # Индикатор качества связи катушек: сколько ИЗ ЗАПРОШЕННОГО тока реально доходит до батареи.
-        # Драйвер сам задаёт уставку (регистр 18), поэтому «факт / уставка» — прямая мера передачи:
-        # 100 % = борт берёт всё, что просим; меньше — энергия теряется на плохой посадке.
-        # Возвращает (проценты, пояснение) или (None, причина), если мерить нечего.
+        # Индикатор посадки катушек — по ПРОСАДКЕ входного напряжения, а не по току.
+        # Почему не «факт/уставка»: когда батарея заряжена, УПС сам перестаёт брать ток (борт при этом
+        # продолжает питаться от площадки) — и метрика по току показывала бы «плохую связь» там, где всё в порядке.
+        # Просадка от такого не зависит: при хорошей передаче Vin держится у холостых ~12.7 В и садится
+        # примерно на 0.35 В на каждый ампер заряда; при кривой посадке проваливается на 2 В и больше.
+        # Проверено на 9 днях истории: хорошие сессии дают недобор 0.03…0.26 В, плохие — 2.0…2.2 В.
         for ch in self.drv.channels.values():
-            if ch.mode!=CHARGE or ch.tele.get("vin",0)<=5: continue      # борт не на паду / не заряжается
-            sp=float(ch.chg_setpoint or 0); i_ma=ch.tele.get("current",0.0)*1000.0
-            if sp<=0: return None,"нет уставки"
-            if ch.tele.get("vbat",0)>=8.05:                              # батарея почти полная: недобор нормален,
-                return 100,"батарея полная"                              # ограничивает не связь, а сам заряд
-            if i_ma<=0: return 0,"тока нет"
-            return max(0,min(100,int(round(100.0*i_ma/sp)))),""
-        return None,"нет заряжающегося борта"
+            vin=ch.tele.get("vin",0.0)
+            if vin<=5: continue                                  # борт не на паду (энергии нет)
+            ib=max(0.0,ch.tele.get("current",0.0))               # ток заряда, А (разряд не учитываем)
+            dev=(LK_VOPEN-LK_REFF*ib)-vin                        # недобор напряжения против ожидаемого
+            p=max(0,min(100,int(round(100.0*(1.0-dev/LK_DEVFULL)))))
+            self._lk.append(p); self._lk=self._lk[-LK_SMOOTH:]   # сглаживаем: на старте/остановке заряда бывают выбросы
+            med=sorted(self._lk)[len(self._lk)//2]
+            return med,"недобор %.2f В"%dev
+        return None,"борта на паду нет"
     def handle(self,dev,ctrl,val):
         on=(val in ("1","true","on"))
         for i,ch in enumerate(self.chargers):
