@@ -228,13 +228,19 @@
                   "type": "integer",
                   "title": "Порог записи, мА",
                   "default": 40,
-                  "propertyOrder": 7
+                  "propertyOrder": 8
                 },
                 "min_write_s": {
                   "type": "number",
                   "title": "Не чаще, с",
                   "default": 20,
-                  "propertyOrder": 8
+                  "propertyOrder": 9
+                },
+                "slope_win_s": {
+                  "type": "number",
+                  "title": "Окно оценки скорости, с",
+                  "default": 240,
+                  "propertyOrder": 7
                 }
               },
               "options": {

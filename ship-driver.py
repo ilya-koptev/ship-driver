@@ -77,7 +77,7 @@ DEFAULTS={
  # драйвер сам держит температуру чуть ниже порога и при этом выжимает максимально возможный ток.
  "charge":{"full_ma":2000,
            "thermal":{"enabled":True,"t_target_c":48.0,"min_ma":300,
-                      "kp_ma_per_c":400.0,"ki_ma_per_c_s":3.0,"lead_min":5.0,
+                      "kp_ma_per_c":400.0,"ki_ma_per_c_s":3.0,"lead_min":5.0,"slope_win_s":240,
                       "deadband_ma":40,"min_write_s":20},
            # индикатор посадки катушек: ожидаемое Vin = v_open - r_eff*Ibat; недобор dev_full_v = 0 %
            "link":{"v_open_v":12.7,"r_eff_ohm":0.35,"dev_full_v":2.0,"smooth":5}},
@@ -132,6 +132,7 @@ THERM_ON=bool(_TH.get("enabled",True)); T_TARGET=float(_TH.get("t_target_c",48.0
 CHG_MIN=int(_TH.get("min_ma",300)); TH_KP=float(_TH.get("kp_ma_per_c",400.0))
 TH_KI=float(_TH.get("ki_ma_per_c_s",3.0)); TH_LEAD=float(_TH.get("lead_min",5.0))
 TH_DEAD=int(_TH.get("deadband_ma",40)); TH_WRITE_S=float(_TH.get("min_write_s",20))
+TH_SLOPE_WIN=float(_TH.get("slope_win_s",240))   # окно оценки скорости роста температуры (МНК)
 _LK=M["charge"].get("link",{})
 LK_VOPEN=float(_LK.get("v_open_v",12.7)); LK_REFF=float(_LK.get("r_eff_ohm",0.35))
 LK_DEVFULL=float(_LK.get("dev_full_v",2.0)); LK_SMOOTH=int(_LK.get("smooth",5))
@@ -526,11 +527,17 @@ class Channel(threading.Thread):
         # Процесс инерционный, поэтому регулируем по ПРЕДСКАЗАННОЙ температуре: t + скорость_роста * TH_LEAD.
         # Это тот же D-член, но в понятном виде — «где будем через TH_LEAD минут». Чистого D по шуму нет.
         now=time.monotonic()
-        self._th_win.append((now,t)); self._th_win=[(x,y) for x,y in self._th_win if now-x<=60.0]
+        self._th_win.append((now,t)); self._th_win=[(x,y) for x,y in self._th_win if now-x<=TH_SLOPE_WIN]
+        # Наклон — методом наименьших квадратов по всему окну, а НЕ разностью крайних точек.
+        # Датчик отдаёт температуру ступеньками ~0.1 °C, и разность двух точек давала скачки
+        # ±0.3 °C/мин: умноженные на горизонт и Kp, они мотали ток 300<->1100 мА и писали регистр
+        # 18 сотни раз в сутки. МНК по 240 с гасит это на порядок (проверено на модели с квантованием).
         slope=0.0
-        if len(self._th_win)>1:
-            dt=(self._th_win[-1][0]-self._th_win[0][0])/60.0
-            if dt>0: slope=(self._th_win[-1][1]-self._th_win[0][1])/dt     # °C/мин
+        w=self._th_win
+        if len(w)>2:
+            n=len(w); mx=sum(x for x,_ in w)/n; my=sum(y for _,y in w)/n
+            den=sum((x-mx)**2 for x,_ in w)
+            if den>0: slope=sum((x-mx)*(y-my) for x,y in w)/den*60.0    # °C/мин
         e=T_TARGET-(t+slope*TH_LEAD)
         if t>=T_TARGET+1.0:                       # вплотную к отсечке — сразу в минимум, интеграл сбрасываем
             self._th_i=0.0; out=CHG_MIN
