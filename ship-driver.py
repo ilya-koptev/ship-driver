@@ -9,6 +9,10 @@
 # boatN MQTT device = operational API + visualisation (driven by external software); LoRa config
 # lives in the conf, only LoRa_address is live on boatN (writes the modem immediately, applying the
 # conf channel/air/power + the new address). Wired ship pre-config stays on the "Ship Setup" dashboard.
+# shipN (N from ships.list) mirrors the physics of whichever channel currently serves that ship, so
+# history is kept per SHIP, not per radio point; radio metrics stay on boatN. boatN is unchanged —
+# it is the external API. NOTE: every device must be listed in /etc/mosquitto/acl/ship.conf, or the
+# broker drops our connection on the first publish (MQTT 3.1.1 has no way to report a denied publish).
 import time, threading, queue, json, os, re, signal, socket, math
 import serial
 import paho.mqtt.client as mqtt
@@ -103,7 +107,9 @@ DEFAULTS={
                "back_right":{"slave":11,"channel":1},"front_right":{"slave":11,"channel":2}},
      "lights":{"nav_lights":{"slave":11,"channel":3},"morse_lamp":{"slave":12,"channel":3},"deck_lights":{"slave":13,"channel":1},
                "cabin_light1":{"slave":13,"channel":2},"cabin_light2":{"slave":13,"channel":3}}},
-   "list":[],   # per ship: {"address":N,"channel":C,"motors":{...},"lights":{...}}
+   # Борта 1..10. Разводка у элемента необязательна — чего нет, берётся из "default".
+   # Для каждого борта из этого списка заводится своё MQTT-устройство shipN (история физики по кораблю, а не по точке).
+   "list":[{"address":n} for n in range(1,11)],
  },
  "chargers":[   # wireless charging stations on Modbus-RTU-over-TCP gateways. relay = XKT-801 transmitter + hold magnets (separate channels); MAI = tx current (voltage drop on a shunt). Each charger has its own "gateway".
    {"gateway":"192.168.69.33:8886",
@@ -155,7 +161,6 @@ RSSI_BYTE=True     # E220 reg 0x05 бит7: модем дописывает 1 б
                    # иначе лишний байт побьёт их локальный Modbus. Флаг обязан совпадать с реальным конфигом модема.
 LORA_DEFAULT_RAW="xxxx6760xx03000010"   # .6 reference 9-byte dump (x = variable addr/channel; 67/60 SPED/OPTION; 03 reg5; 0000 crypt; 10 version)
 LORA_PLAN=C["lora"]   # {mod1..4: {channel,air_rate,address,power}} (top-level)
-SETUP_DEFAULTS={"channel":14,"air_rate":62.5,"address":3,"power":22}   # Ship Setup dashboard defaults (hardcoded)
 GRKCH_CHANNELS={14,16,17,19}   # ГКРЧ-allowed LoRa channels
 def grkch(ch):
     try: return "✓ in band (GKRCh)" if int(ch) in GRKCH_CHANNELS else "⚠ out of band"
@@ -163,16 +168,23 @@ def grkch(ch):
 ADDR_MAX=65535   # ship_number (= LoRa address) control max (hardcoded)
 ENABLED_AT_START=set(n for n,v in M["enabled_at_start"].items() if v)
 SENSOR_FALLBACK={"enabled":True,"address":14,"invert":False}
-def parse_wiring(w):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[...], sensor{...}) — всё это per-ship
-    motors=[(n,m["slave"],m["channel"]) for n,m in w["motors"].items()]
-    lights=[(n,l["slave"],l["channel"]) for n,l in w["lights"].items()]
-    sen=dict(SENSOR_FALLBACK); sen.update(w.get("sensor") or {})   # датчик курса стоит не на каждом борту
+def parse_wiring(w,base=None):   # -> (motors[(name,slave,ch)], motor_map{name:(slave,ch)}, lights[...], sensor{...}) — всё это per-ship
+    # base = "ships.default": в элементе списка разводку можно не указывать вовсе (у всех бортов она одинаковая),
+    # тогда берётся типовая. Иначе на 10 кораблей страница настроек раздувалась бы в сотню одинаковых полей.
+    b=base or {}
+    motors=[(n,m["slave"],m["channel"]) for n,m in (w.get("motors") or b.get("motors") or {}).items()]
+    lights=[(n,l["slave"],l["channel"]) for n,l in (w.get("lights") or b.get("lights") or {}).items()]
+    sen=dict(SENSOR_FALLBACK); sen.update(b.get("sensor") or {}); sen.update(w.get("sensor") or {})   # датчик курса стоит не на каждом борту
     return motors,{n:(s,c) for n,s,c in motors},lights,sen
 SD=C["ships"]; SHIP_DEFAULT=SD["default"]; SHIP_LIST=SD.get("list",[])
 DEFAULT_WIRING=parse_wiring(SHIP_DEFAULT)                       # fallback wiring (address not in list)
 DEFAULT_AIR_RATE=SHIP_DEFAULT["air_rate"]; DEFAULT_POWER=SHIP_DEFAULT["power"]   # shared for all ships
-SHIP_WIRING={int(s["address"]):parse_wiring(s) for s in SHIP_LIST}              # LoRa address -> wiring
-SHIP_RADIO={int(s["address"]):{"channel":s["channel"],"air_rate":DEFAULT_AIR_RATE,"power":DEFAULT_POWER} for s in SHIP_LIST}  # number -> radio for Ship Setup write
+SHIP_WIRING={int(s["address"]):parse_wiring(s,SHIP_DEFAULT) for s in SHIP_LIST}  # LoRa address -> wiring
+SHIP_NUMBERS=sorted({int(s["address"]) for s in SHIP_LIST})     # борта из конфига -> у каждого своё устройство shipN
+SHIP_NUMSET=set(SHIP_NUMBERS)
+# Ship Setup пишет в борт по кабелю: адрес и канал берутся из полей, всё остальное — из ships.default
+# (раньше air_rate/power были зашиты в код и могли расходиться с планом в конфиге).
+SETUP_DEFAULTS={"channel":14,"address":3,"air_rate":DEFAULT_AIR_RATE,"power":DEFAULT_POWER}
 def wiring_for(addr):
     try: return SHIP_WIRING.get(int(addr),DEFAULT_WIRING)
     except Exception: return DEFAULT_WIRING
@@ -191,6 +203,29 @@ _MT={"front_right":"Front Right","back_right":"Back Right","front_left":"Front L
 MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
+KEEP_ON_RELEASE={"nav_lights"}   # что НЕ гасим, отпуская борт: ходовые огни горят и на брошенном катере
+# Телеметрия точки: (control, units, title). Один список на все дашборды — у корабля те же подписи, что у точки.
+BOAT_TELE=(("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),
+           ("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),
+           ("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("link_score","","Link score (0-100)"),
+           ("charge_setpoint","mA","Charge current setpoint"),("read_failures","","Read failures (5 min)"),
+           ("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),
+           ("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),
+           ("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),
+           ("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),
+           ("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),
+           ("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),
+           ("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3"))
+# ---- зеркало по кораблям (shipN) ----
+# Борт кочует между радиоточками, поэтому историю физики надо вести ПО КОРАБЛЮ. boat1..4 при этом не меняется —
+# это внешний API (сторонний софт, ACL), shipN лишь ДОПОЛНИТЕЛЬНАЯ копия тех же значений.
+# Радиометрики (RSSI, счётчики связи, link_score) на корабль НЕ уходят: они про антенну берега и её эфир, а не про борт.
+SHIP_RADIO_ONLY={"rssi","comms_errors","link_quality","link_score","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"}
+SHIP_TELE=tuple(t for t in BOAT_TELE if t[0] not in SHIP_RADIO_ONLY)
+SHIP_CMD=MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume"]   # это уходит на точку как есть
+SHIP_CTL=["radio_point","active"]   # управление на уровне БОРТА: где стоит и занимает ли точку
+SHIP_MIRROR=set(["mode"]+[t[0] for t in SHIP_TELE]+SHIP_CMD)
+SHIP_CONTROLS=["radio_point","active","mode"]+[t[0] for t in SHIP_TELE]+SHIP_CMD   # для сноса устройства при остановке
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","charge_setpoint","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
@@ -352,10 +387,27 @@ class Channel(threading.Thread):
         self.ser.reset_input_buffer(); self.ser.write(fr); self.ser.flush(); time.sleep(0.25)
 
     # ---- MQTT helpers ----
+    def sdev(self):
+        # устройство корабля, который СЕЙЧАС на этой точке; None, если такого номера нет в списке кораблей
+        try: n=int(self.lora["address"])
+        except Exception: return None
+        if n not in SHIP_NUMSET: return None
+        # борт мог переехать на другую точку, а его номер остался в адресе этой — тогда писать в его
+        # топики не наше дело: зеркалит только та точка, которой борт принадлежит
+        if self.drv.channel_for_ship(n) is not self: return None
+        return "ship%d"%n
     def pub(self,ctrl,val):
-        if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s"%(self.dev,ctrl),str(val),retain=True)
+        if self.drv.mqtt is None: return
+        self.drv.mqtt.publish("/devices/%s/controls/%s"%(self.dev,ctrl),str(val),retain=True)
+        if ctrl in SHIP_MIRROR:   # физику дублируем на вкладку борта -> история пишется по кораблю, а не по радиоточке
+            sd=self.sdev()
+            if sd: self.drv.mqtt.publish("/devices/%s/controls/%s"%(sd,ctrl),str(val),retain=True)
     def puberr(self,ctrl,err):   # WB convention: /controls/<c>/meta/error = "r" (read error) -> homeui greys/colours it; "" = ok
-        if self.drv.mqtt is not None: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(self.dev,ctrl),err,retain=True)
+        if self.drv.mqtt is None: return
+        self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(self.dev,ctrl),err,retain=True)
+        if ctrl in SHIP_MIRROR:
+            sd=self.sdev()
+            if sd: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(sd,ctrl),err,retain=True)
 
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
@@ -364,7 +416,10 @@ class Channel(threading.Thread):
         iv=int(fv); is_cmd=True
         if ctrl=="enabled":
             self.enabled=(val in ("1","true","on")); is_cmd=False
-            if not self.enabled: self.online=False; self.set_mode(OFF); self.close()
+            self.pub("enabled",1 if self.enabled else 0)   # точку может выключить и сам драйвер (с вкладки борта) -> значение надо отдать
+            if not self.enabled:
+                self.release_ship()   # пока связь ещё есть: газ в холостой, свет и звук долой
+                self.online=False; self.set_mode(OFF); self.close()
         elif ctrl in self.motor_map and self.online:
             s,c=self.motor_map[ctrl]; self.motor[ctrl]=max(MOTOR_MIN,min(MOTOR_MAX,iv)); self.write_reg(s,DUTY_REG[c],self.motor[ctrl]); self.pub(ctrl,self.motor[ctrl])
         elif ctrl in self.light_map and self.online:
@@ -377,13 +432,16 @@ class Channel(threading.Thread):
         elif ctrl=="ship_number":
             # ship number = LoRa address. Persist FIRST (survives reboot even if the slow modem write is interrupted), then write modem.
             is_cmd=False; changed=(iv!=self.lora["address"])
-            self.lora["address"]=iv; self.apply_wiring(); self.pub(ctrl,iv); self.drv.save(); self.lora_op(self.lora)
+            if changed: self.release_ship()   # отпускаем ПРЕЖНИЙ борт, пока модем ещё настроен на него
+            self.lora["address"]=iv; self.apply_wiring(); self.pub(ctrl,iv); self.drv.save()
+            self.drv.pub_ship_points()   # борт сменился -> у кого какая точка (и у осиротевшего борта прочерк вместо чужого режима)
+            self.lora_op(self.lora)
             if changed:   # switched to a DIFFERENT boat -> re-detect so init_ship (freq=400 + idle, which arms the motor ESCs) runs for it
                 self.force_init=True   # смена корабля -> полный init_ship (сброс в холостой + переарм), НЕ resume: не тащим газ с прежнего борта
                 self.online=False; self.fails=0; self.due={}
                 print("[%s] ship_number -> %d: forcing re-init (SEARCH) for the new boat"%(self.name,iv),flush=True)
         else: is_cmd=False
-        if ctrl=="enabled": self.drv.save()
+        if ctrl=="enabled": self.drv.save(); self.drv.pub_ship_points()   # active у бортов этой точки изменился
         if is_cmd: self.last_cmd=time.monotonic()
     def drain(self):
         while True:
@@ -415,7 +473,7 @@ class Channel(threading.Thread):
                     if len(r2)>=11 and r2[0]==0xC1: b=r2[3:11]; print("[%s] modem after write raw=%s"%(self.name,b.hex()),flush=True)
                 self.lora={"channel":b[4],"air_rate":float(AIR_NAME.get(b[2]&7,"62.5")),
                            "address":(b[0]<<8)|b[1],"power":int(PWR_NAME.get(b[3]&3,"22"))}
-                self.apply_wiring(); self.pub("ship_number",self.lora["address"])
+                self.apply_wiring(); self.pub("ship_number",self.lora["address"]); self.drv.pub_ship_points()
             else: print("[%s] modem: no response"%self.name,flush=True)
         except Exception as e: print("[%s] lora err %s"%(self.name,e),flush=True)
         finally:
@@ -457,6 +515,26 @@ class Channel(threading.Thread):
                 self.write_regs(s,DUTY_REG[cs[0]],[chans[c] for c in cs])
             else:
                 for c in cs: self.write_reg(s,DUTY_REG[c],chans[c])      # с дырой — поштучно
+    def release_ship(self):
+        # Уходим от борта (переключились на другой или выключили точку) — оставляем его в безопасном виде:
+        # газ в холостой, свет погашен кроме ходовых огней, звук выключен. Без этого брошенный катер
+        # продолжает идти на прежнем газу, пока не сядет: точка просто перестаёт с ним говорить, а
+        # скважность остаётся в его ШИМ-модулях.
+        # ВАЖНО: зовётся ДО смены адреса модема и до закрытия порта, иначе команды уйдут в никуда.
+        if not self.online:
+            return False   # борта и так нет на связи — писать некуда, только эфир занимать
+        for n,_,_ in self.motors: self.motor[n]=INIT_MOTOR
+        for n,_,_ in self.lights:
+            if n not in KEEP_ON_RELEASE: self.light[n]=0
+        self.push_duty()
+        try: self.send_mp3(mp3_frame(MP3["stop"]))
+        except Exception as e: print("[%s] звук не выключился: %s"%(self.name,e),flush=True)
+        for n,_,_ in self.motors: self.pub(n,self.motor[n])
+        for n,_,_ in self.lights: self.pub(n,self.light[n])
+        self.pub("mp3_track",0)
+        print("[%s] отпускаю борт %d: газ в холостой, свет погашен (кроме %s), звук выкл"
+              %(self.name,self.lora["address"],", ".join(sorted(KEEP_ON_RELEASE))),flush=True)
+        return True
     def resume_ship(self):
         # реконнект после короткого провала связи: модули живы, просто заново утверждаем последний заданный газ/свет — БЕЗ сброса в холостой
         self.push_duty()
@@ -658,6 +736,7 @@ class Channel(threading.Thread):
                         self.init_ship(); self.last_cmd=0.0
                     self.force_init=False
                     self.set_mode(self.decide())
+                    self.drv.bind_ship(self)   # борт тут реально есть -> закрепляем привязку борт<->точка
                 else: time.sleep(SEARCH_PERIOD)
                 continue
             self.set_mode(self.decide())
@@ -838,15 +917,36 @@ class Driver:
                 try: ch.lora["address"]=int(sn); ch.apply_wiring()
                 except Exception: pass
         self.mqtt=None
+        # Какая радиоточка выделена борту. Единственное, что хранится на уровне корабля: сам факт
+        # «борт активен» НЕ хранится, а выводится из того, кто сейчас занимает точку и включена ли она —
+        # иначе появился бы второй источник правды, который начал бы расходиться с boatN.
+        # По умолчанию борта раскиданы по точкам по кругу: борт без точки — состояние ненормальное,
+        # его нечем показать в панели (точки 0 не существует). Само по себе это ничего не включает:
+        # борт занимает точку только если та несёт его номер.
+        npt=max(1,len(CHANNELS))
+        self.ship_pt={n:((n-1)%npt)+1 for n in SHIP_NUMBERS}
+        for k,v in (st.get("ships") or {}).items():
+            try:
+                p=int((v or {}).get("point",0))
+                if int(k) in self.ship_pt and 1<=p<=npt: self.ship_pt[int(k)]=p
+            except Exception: pass
+        # Из номера, лежащего в модеме точки, привязку НЕ выводим: там может лежать метка, вписанная
+        # когда-то руками, а борта на этой точке нет уже неделю. Привязка появляется, только когда борт
+        # на точке реально ответил (bind_ship), либо когда её задал оператор.
         self.setup_number=int(SETUP_DEFAULTS["address"]); self.setup_channel=int(SETUP_DEFAULTS["channel"])   # Ship Setup editable: number + channel
         self.setup_air=float(SETUP_DEFAULTS["air_rate"]); self.setup_power=int(SETUP_DEFAULTS["power"])        # preserved from last read, used on write
-        self.setupq=queue.Queue()
+        self.setupq=queue.Queue(); self.shipq=queue.Queue()
         self.chargerbus=ChargerBus(self,[dict(c) for c in CHG_LIST]) if CHG_LIST else None
     def load(self):
         try: return json.load(open(STATE_FILE))
         except Exception: return {}
     def save(self):
-        try: json.dump({n:{"enabled":c.enabled,"ship_number":c.lora["address"]} for n,c in self.channels.items()},open(STATE_FILE,"w"))
+        # Точки остаются как были (совместимо с прежним файлом), борта добавлены отдельным ключом:
+        # "ships" не конфликтует с именами "mod1".."mod4", поэтому миграция не нужна ни туда, ни обратно.
+        try:
+            st={n:{"enabled":c.enabled,"ship_number":c.lora["address"]} for n,c in self.channels.items()}
+            st["ships"]={str(n):{"point":p} for n,p in sorted(self.ship_pt.items())}
+            json.dump(st,open(STATE_FILE,"w"))
         except Exception as e: print("state save err",e,flush=True)
     def setup_mqtt(self):
         try:
@@ -888,7 +988,7 @@ class Driver:
         ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
         ctl("ship_number",{"type":"value","readonly":False,"min":0,"max":ADDR_MAX,"title":"Ship number"},ch.lora["address"])   # always visible (set ship even while searching)
         if full:
-            for nm,u,t in (("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),("comms_errors","","Comms errors (5 min)"),("link_quality","%","Link quality"),("link_score","","Link score (0-100)"),("charge_setpoint","mA","Charge current setpoint"),("read_failures","","Read failures (5 min)"),("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),("mag_x","","Mag X"),("mag_y","","Mag Y"),("mag_z","","Mag Z"),("sensor_temp","°C","Sensor temp"),("q0","","Quaternion q0"),("q1","","Quaternion q1"),("q2","","Quaternion q2"),("q3","","Quaternion q3")):
+            for nm,u,t in BOAT_TELE:
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
@@ -897,11 +997,125 @@ class Driver:
         else:
             for c in BOAT_EXTRA: self.clear_ctrl(d,c)   # remove control: clear meta (incl. legacy), error, value
         ch.declared_full=full
+    def channel_for_ship(self,n):
+        # Точка борта — та, к которой он ПРИВЯЗАН и которая при этом несёт его номер. Нужны оба условия:
+        #   метка без привязки — могла остаться в модеме с прошлой недели, борта там давно нет;
+        #   привязка без метки — номер на точке уже сменили, борт с неё снят.
+        # Заодно снимается неоднозначность: после переезда номер остаётся и в модеме прежней точки
+        # (стирать его — лишняя запись в модем), но владельцем она уже не считается.
+        ch=self.pt_channel(self.ship_pt.get(n,0))
+        try: return ch if (ch is not None and int(ch.lora["address"])==n) else None
+        except Exception: return None
+    def ship_controls(self,n):
+        # Вкладка борта: те же значения, что на его точке, но БЕЗ радиометрик (они про берег).
+        # Устройство объявляется всегда, даже если борт сейчас ни на одной точке: иначе история корабля
+        # рвалась бы при каждом переключении, а ради неё всё и делается. Значения просто перестают обновляться.
+        d="ship%d"%n; o=[0]
+        def ctl(name,meta,val=None):
+            o[0]+=1; m=dict(meta,order=o[0])
+            if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}
+            self.pub_ctrl_meta(d,name,m)
+            if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(d,name),str(val),retain=True)
+        self.setname(d,"Ship %d"%n)
+        # Точки 0 не существует: пока борт ни к одной не приписан, поле пустое (пустые value-ячейки
+        # рисуются нормально — так же сделаны поля Ship Setup). Вписать можно только 1..4.
+        # Подписи держим короткими: в узкой плашке длинный заголовок переносится и ломает вид.
+        ctl("radio_point",{"type":"value","readonly":False,"min":1,"max":len(CHANNELS),"title":"Radio point"})
+        ctl("active",{"type":"switch","readonly":False,"title":"Active"})
+        ctl("mode",{"type":"text","readonly":True,"title":"Mode"})
+        for nm,u,t in SHIP_TELE: ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
+        # Ползунок БЕЗ значения homeui рисует голым числом без подписи, и плашка рассыпается — поэтому
+        # значение есть у каждого всегда. У борта на точке берём то, что точка сейчас держит (не выдумываем),
+        # у остальных — холостой газ и погашенный свет.
+        ch=self.channel_for_ship(n)
+        mot=(lambda k: ch.motor.get(k,INIT_MOTOR)) if ch is not None else (lambda k: INIT_MOTOR)
+        lit=(lambda k: ch.light.get(k,0)) if ch is not None else (lambda k: 0)
+        for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]},mot(n2))
+        for n2 in LIGHT_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n2,n2)},lit(n2))
+        ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"},0)
+        ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"},0)
+    def pt_channel(self,p): return self.channels.get("mod%d"%p) if p else None
+    def bind_ship(self,ch):
+        # Борт ОТВЕТИЛ на этой точке — вот это и есть доказательство, что он тут стоит. Только по такому
+        # событию привязка и меняется сама (номер могли сменить прямо с boatN). Метка в модеме молчащей
+        # точки доказательством не является: она могла остаться там с прошлой недели.
+        try: n=int(ch.lora["address"])
+        except Exception: return
+        p=int(ch.name[-1])
+        if n in self.ship_pt and self.ship_pt[n]!=p:
+            self.ship_pt[n]=p; self.save()
+            print("[%s] борт %d отозвался здесь -> привязываю его к этой точке"%(ch.name,n),flush=True)
+        self.pub_ship_points()
+    def ship_active(self,n):
+        ch=self.channel_for_ship(n)
+        return bool(ch is not None and ch.enabled)
+    def pub_ship_points(self):
+        # active выводится, а не хранится: борт активен, если он занимает свою точку и точка включена.
+        # Поэтому «включили один — остальные выключились» получается само: на точке ровно один адрес.
+        # Осиротевшему борту в режим ставим прочерк, иначе висел бы чужой CHARGING от прошлой привязки.
+        if self.mqtt is None: return
+        for n in SHIP_NUMBERS:
+            ch=self.channel_for_ship(n); on=bool(ch is not None and ch.enabled)
+            self.mqtt.publish("/devices/ship%d/controls/radio_point"%n,str(self.ship_pt.get(n,0)),retain=True)
+            self.mqtt.publish("/devices/ship%d/controls/active"%n,"1" if on else "0",retain=True)
+            self.mqtt.publish("/devices/ship%d/controls/mode"%n,(ch.mode if (on and ch.mode) else "—"),retain=True)
+    # ---- управление на уровне борта: транслируем в уже обкатанные команды точки ----
+    def ship_worker(self):
+        while True:
+            n,ctrl,val=self.shipq.get()
+            try: self.handle_ship(n,ctrl,val)
+            except Exception as e: print("[ship%d] err %s %s"%(n,ctrl,e),flush=True)
+    def handle_ship(self,n,ctrl,val):
+        if ctrl=="radio_point":
+            # принимаем только существующую точку: 1..N. Ноль, пустое и мусор игнорируем — освободить
+            # точку можно тумблером active, а «борт без точки» в панели нечем показать.
+            try: p=int(float(val))
+            except Exception: p=0
+            if not (1<=p<=len(CHANNELS)):
+                print("[ship%d] радиоточки %r не существует, оставляю %s"%(n,val,self.ship_pt.get(n)),flush=True)
+                self.pub_ship_points(); return
+            old=self.ship_pt.get(n,0)
+            if p==old: self.pub_ship_points(); return
+            was=self.ship_active(n)
+            self.ship_pt[n]=p; self.save()
+            print("[ship%d] радиоточка %s -> %s"%(n,old or "нет",p or "нет"),flush=True)
+            if was:                                   # активный борт переезжает: старую точку глушим, новую поднимаем
+                oc=self.pt_channel(old)
+                if oc is not None: oc.q.put(("enabled","0"))
+                # p=0 — это «снять борт с точки», поднимать нечего; состояние опубликует сама точка,
+                # когда выполнит выключение (публиковать сейчас рано: в очереди ещё не разобрано)
+                if p: self.activate(n,p)
+            else: self.pub_ship_points()
+        elif ctrl=="active":
+            if val in ("1","true","on"):
+                p=self.ship_pt.get(n,0)
+                if not p: print("[ship%d] включать нечего: не выбрана радиоточка"%n,flush=True)
+                else: self.activate(n,p); return
+            else:
+                ch=self.channel_for_ship(n)
+                if ch is not None: ch.q.put(("enabled","0"))
+            self.pub_ship_points()
+    def activate(self,n,p):
+        ch=self.pt_channel(p)
+        if ch is None:
+            print("[ship%d] радиоточка mod%d недоступна (модем при старте не отозвался)"%(n,p),flush=True)
+            self.pub_ship_points(); return
+        # Команды кладём в очередь САМОЙ точки: их выполнит её поток тем же кодом, что и команды с boatN
+        # (смена номера = переарм ESC, enabled = открыть порт). Никакой новой логики и никаких гонок.
+        if int(ch.lora["address"])!=n: ch.q.put(("ship_number",str(n)))
+        ch.q.put(("enabled","1"))
+        print("[ship%d] занимает mod%d (прочие борта этой точки становятся неактивными)"%(n,p),flush=True)
+        self.pub_ship_points()
     def declare(self):
         for n,ch in self.channels.items():
             self.setname(ch.dev,"boat%s (channel %s)"%(n[-1],ch.lora["channel"]))
             self.boat_controls(ch, ch.online and ch.enabled)   # collapsed until the channel actually polls a ship
             self.mqtt.subscribe("/devices/%s/controls/+/on"%ch.dev)
+        # ---- вкладки кораблей (shipN) — зеркало физики + приём команд ----
+        for n in SHIP_NUMBERS:
+            self.ship_controls(n)
+            self.mqtt.subscribe("/devices/ship%d/controls/+/on"%n)
+        self.pub_ship_points()
         # ---- Ship Setup dashboard (RS485-1 wired config) — unchanged ----
         sd="ship_setup"
         self.setname(sd,"Ship Setup (RS485-1)")
@@ -959,17 +1173,37 @@ class Driver:
         try:
             if self.mqtt is not None:
                 for ch in self.channels.values(): self.clear_device(ch.dev,BOAT_CONTROLS)
+                for n in SHIP_NUMBERS: self.clear_device("ship%d"%n,SHIP_CONTROLS)
                 self.clear_device("ship_setup",SETUP_CONTROLS)
                 if self.chargerbus is not None:
                     for i in range(len(self.chargerbus.chargers)): self.clear_device(self.chargerbus.dev(i),CHARGER_CONTROLS)
                 time.sleep(0.6)   # let the retained clears flush before we exit
         except Exception as e: print("shutdown clear err",e,flush=True)
         os._exit(0)
-    def on_connect(self,c,u,f,rc,props=None): self.declare()
+    def on_connect(self,c,u,f,rc,props=None):
+        # Падение внутри on_connect paho проглатывает (в журнале ни строчки), а брокер после этого
+        # роняет соединение -> драйвер уходит в бесконечный цикл переподключений и молчит. Логируем сами.
+        # ВАЖНО: публикация в устройство, которого нет в ACL порта 1883 (/etc/mosquitto/acl/ship.conf),
+        # для MQTT 3.1.1 = отключение клиента брокером. Новое устройство -> сначала строка в ACL.
+        try:
+            self.declare()
+            print("declare: точки %s, корабли %s"%(sorted(self.channels),SHIP_NUMBERS),flush=True)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print("declare err: %s"%e,flush=True)
     def on_message(self,c,u,msg):
         p=msg.topic.split("/"); dev=p[2]; ctrl=p[4]; val=msg.payload.decode(errors="ignore").strip()
         if dev=="ship_setup": self.setupq.put((ctrl,val)); return
         if dev.startswith("charger") and self.chargerbus is not None: self.chargerbus.q.put((dev,ctrl,val)); return
+        if dev.startswith("ship") and dev[4:].isdigit():
+            # команда с вкладки борта -> на ту точку, где борт сейчас стоит
+            n=int(dev[4:])
+            if n not in SHIP_NUMSET: return
+            if ctrl in SHIP_CTL: self.shipq.put((n,ctrl,val)); return   # привязка к точке / занять точку
+            if ctrl not in SHIP_CMD: return   # enabled и номер борта — свойства ТОЧКИ, с вкладки корабля их не меняют
+            ch=self.channel_for_ship(n)
+            if ch is None: print("[ship%d] команда %s=%s пропущена: борт не привязан ни к одной радиоточке"%(n,ctrl,val),flush=True); return
+            ch.q.put((ctrl,val)); return
         for ch in self.channels.values():
             if ch.dev==dev: ch.q.put((ctrl,val)); return
     # ---- Ship Setup (RS485-1) handlers ----
@@ -1030,7 +1264,9 @@ class Driver:
         signal.signal(signal.SIGTERM,self.shutdown); signal.signal(signal.SIGINT,self.shutdown)   # clear dashboards on stop
         for ch in self.channels.values(): ch.start()
         threading.Thread(target=self.setup_worker,daemon=True).start()
+        threading.Thread(target=self.ship_worker,daemon=True).start()
         if self.chargerbus is not None: self.chargerbus.start(); print("charger bus: %d station(s)"%len(self.chargerbus.chargers),flush=True)
+        self.save()   # привязки бортов к точкам могли вывестись из адресов при старте -> закрепляем их в файле состояния
         while True: time.sleep(1)
 
 if __name__=="__main__": Driver().start()
