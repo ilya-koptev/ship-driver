@@ -152,6 +152,7 @@ SENSOR_GIVEUP=3   # столько неудач подряд -> считаем, 
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
 COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
+LOST_MISSES=int(M["rates"].get("lost_misses",6))   # столько неответов подряд по ОДНОМУ модулю = авария: идти с этим нельзя
 DIAG_LOG=True     # писать в журнал строку на каждый промах чтения (тип/slave/RSSI/байты) — для разбора природы ошибок
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
 REG5_TXMODE=0x03   # E220 reg 0x05: transparent, LBT OFF, WOR=3 (match working .6 modems; some modules ship with LBT on)
@@ -283,6 +284,8 @@ class Channel(threading.Thread):
         self.mode=None; self.online=False; self.fails=0   # mode=None so the first set_mode always fires (incl. OFF gpio)
         self.declared_full=False   # whether the full control set is currently published (vs collapsed to enabled+mode)
         self.last_cmd=0.0; self.lora_read=False
+        self.mod_miss={s:0 for s in PWM_SLAVES}   # неответы подряд по каждому pwm-модулю
+        self.faulted=set()                        # модули, по которым авария объявлена (повторно не дёргаем)
         self.chg_setpoint=CHG_FULL; self.tele={}; self.rssi=None   # RSSI линка (дБм), из хвостового байта каждого ответа борта
         self._th_i=0.0; self._th_win=[]; self._th_w=0.0            # состояние теплового ПИД-регулятора заряда
         self._rd_att=[]; self._rd_miss=[]   # тайминги попыток/промахов чтения за скользящее окно (сырое качество линка)
@@ -409,6 +412,20 @@ class Channel(threading.Thread):
             sd=self.sdev()
             if sd: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(sd,ctrl),err,retain=True)
 
+    def wr(self,slave,addr,val,ctrl=None):
+        """Запись с проверкой результата. Раньше возврат write_reg игнорировался,
+        и команда на молчащий модуль публиковалась как применённая — оператор видел
+        газ, которого в железе нет (проверено 24.08: back_right=45 висел минуту при
+        полностью мёртвом модуле 11)."""
+        for _ in (1,2):
+            if self.write_reg(slave,addr,val):
+                if ctrl: self.puberr(ctrl,"")
+                return True
+        print("[%s] ЗАПИСЬ НЕ ПРОШЛА: slave=%d reg=%d val=%d%s"
+              %(self.name,slave,addr,val," (%s)"%ctrl if ctrl else ""),flush=True)
+        if ctrl: self.puberr(ctrl,"w")
+        return False
+
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
         try: fv=float(val)
@@ -420,11 +437,24 @@ class Channel(threading.Thread):
             if not self.enabled:
                 self.release_ship()   # пока связь ещё есть: газ в холостой, свет и звук долой
                 self.online=False; self.set_mode(OFF); self.close()
-        elif ctrl in self.motor_map and self.online:
-            s,c=self.motor_map[ctrl]; self.motor[ctrl]=max(MOTOR_MIN,min(MOTOR_MAX,iv)); self.write_reg(s,DUTY_REG[c],self.motor[ctrl]); self.pub(ctrl,self.motor[ctrl])
-        elif ctrl in self.light_map and self.online:
+        elif ctrl in self.motor_map:
+            s,c=self.motor_map[ctrl]; want=max(MOTOR_MIN,min(MOTOR_MAX,iv))
+            if not self.online:
+                # раньше команда тут молча исчезала. Отказ теперь ЯВНЫЙ, но желаемое
+                # в self.motor НЕ пишем: иначе resume_ship на реконнекте выдал бы этот
+                # газ в железо до арминга ESC (рывок), а decide() показал бы SAILING.
+                is_cmd=False; self.puberr(ctrl,"w"); self.pub(ctrl,self.motor.get(ctrl,INIT_MOTOR))
+                print("[%s] команда ОТКЛОНЕНА: %s=%d, борт не на связи (%s)"%(self.name,ctrl,want,self.mode),flush=True)
+            else:
+                self.motor[ctrl]=want; self.pub(ctrl,want); self.wr(s,DUTY_REG[c],want,ctrl)
+        elif ctrl in self.light_map:
             is_cmd=False   # свет не относится к ходу -> не взводит режим SAILING
-            s,c=self.light_map[ctrl]; self.light[ctrl]=max(0,min(100,iv)); self.write_reg(s,DUTY_REG[c],self.light[ctrl]); self.pub(ctrl,self.light[ctrl])
+            s,c=self.light_map[ctrl]; want=max(0,min(100,iv))
+            if not self.online:
+                self.puberr(ctrl,"w"); self.pub(ctrl,self.light.get(ctrl,INIT_LIGHT))
+                print("[%s] команда ОТКЛОНЕНА: %s=%d, борт не на связи (%s)"%(self.name,ctrl,want,self.mode),flush=True)
+            else:
+                self.light[ctrl]=want; self.pub(ctrl,want); self.wr(s,DUTY_REG[c],want,ctrl)
         elif ctrl=="mp3_track" and self.online:
             is_cmd=False; iv=max(0,min(MP3_TRACK_MAX,iv)); self.send_mp3(mp3_frame(MP3["stop"]) if iv<=0 else mp3_frame(MP3["play"],iv)); self.pub("mp3_track",iv)
         elif ctrl=="mp3_volume" and self.online:
@@ -438,7 +468,7 @@ class Channel(threading.Thread):
             self.lora_op(self.lora)
             if changed:   # switched to a DIFFERENT boat -> re-detect so init_ship (freq=400 + idle, which arms the motor ESCs) runs for it
                 self.force_init=True   # смена корабля -> полный init_ship (сброс в холостой + переарм), НЕ resume: не тащим газ с прежнего борта
-                self.online=False; self.fails=0; self.due={}
+                self.online=False; self.fails=0; self.due={}; self.offline_since=time.monotonic()
                 print("[%s] ship_number -> %d: forcing re-init (SEARCH) for the new boat"%(self.name,iv),flush=True)
         else: is_cmd=False
         if ctrl=="enabled": self.drv.save(); self.drv.pub_ship_points()   # active у бортов этой точки изменился
@@ -498,6 +528,7 @@ class Channel(threading.Thread):
         self.push_duty()                                                        # 3) моторы в холостой + свет — блоками по модулям
         for n,s,c in self.motors: self.pub(n,self.motor[n])
         for n,s,c in self.lights: self.pub(n,self.light[n])
+        self.mod_miss={k:0 for k in self.mod_miss}; self.faulted=set()
     def pwm_kept_state(self):
         # True, если все pwm-каналы всё ещё держат INIT_FREQ -> модули не теряли питание (был провал связи, не ребут)
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
@@ -679,7 +710,16 @@ class Channel(threading.Thread):
         for n,s,c in self.motors+self.lights:
             r=block.get(s)
             if r is None: ok=False; self.puberr(n,"r")
-            else: self.pub(n,r[c-1]); self.puberr(n,"")
+            else:
+                hw=r[c-1]; want=(self.motor if n in self.motor else self.light).get(n)
+                # Раньше сюда публиковалось железное значение, а self.motor не менялся:
+                # ползунок показывал одно, драйвер считал другое, decide() давал IDLE при
+                # видимом газе. Хозяин — драйвер: при расхождении утверждаем своё.
+                if want is not None and hw!=want:
+                    print("[%s] %s: в железе %d, задано %d -> переписываю"%(self.name,n,hw,want),flush=True)
+                    self.wr(s,DUTY_REG[c],want,n)
+                else:
+                    self.pub(n,hw); self.puberr(n,"")
         return ok
     def poll_freq_check(self):
         # pwm freq вернулась к дефолту = модуль ребутнулся (браунаут/просадка 5 В).
@@ -689,13 +729,36 @@ class Channel(threading.Thread):
         # модуль и вызовет init_ship (freq=400 + переарм ESC + холостой 40).
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
             r=self.read_regs(s,3,FREQ_REG[1],3)   # FREQ_REG[1]=0 -> [ch1,ch2,ch3]
-            if r is None: continue
+            if r is None:
+                # раньше тут был молчаливый continue: навсегда пропавший модуль не поднимал
+                # ничего, кроме meta/error="r" на своих контролах (случай 24.08: модуль 11
+                # молчал 7.5 часов, правые моторы и навигация мертвы, борт шёл на левых).
+                self.mod_miss[s]=self.mod_miss.get(s,0)+1
+                if self.mod_miss[s]>=LOST_MISSES: self.module_fault(s)
+                continue
+            self.mod_miss[s]=0; self.faulted.discard(s)
             for i,f in enumerate(r):
                 if f!=INIT_FREQ:
                     print("[%s] pwm addr %d ch%d freq drift %d->%d: модуль ребутнулся -> форсирую реинициализацию (переарм ESC)"%(self.name,s,i+1,f,INIT_FREQ),flush=True)
-                    self.online=False; self.fails=0; self.due={}   # -> run(): SEARCH -> init_ship переармит ESC и вернёт холостой
+                    self.online=False; self.fails=0; self.due={}; self.offline_since=time.monotonic()   # -> run(): SEARCH -> init_ship переармит ESC и вернёт холостой
                     return True
         return True
+    def module_fault(self,slave):
+        """Модуль не отвечает совсем: его каналы неуправляемы, идти с этим нельзя.
+        Гасим ОСТАЛЬНЫЕ моторы в холостой и пишем ошибку. Повторно не дёргаем,
+        пока модуль не ответит."""
+        if slave in self.faulted: return
+        self.faulted.add(slave)
+        dead=[nm for nm,sl,c in self.motors+self.lights if sl==slave]
+        print("[%s] ОШИБКА: модуль %d не ответил %d раз подряд. Неуправляемы: %s. "
+              "Гашу остальные моторы в холостой (%d)."
+              %(self.name,slave,self.mod_miss.get(slave,0),", ".join(dead),INIT_MOTOR),flush=True)
+        for nm,sl,c in self.motors:
+            if sl==slave: continue                 # его каналы всё равно не пишутся
+            self.motor[nm]=INIT_MOTOR
+            self.wr(sl,DUTY_REG[c],INIT_MOTOR,nm)
+            self.pub(nm,INIT_MOTOR)
+
     GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check","course":"poll_course"}
     def decide(self):
         if not self.online: return SEARCH
@@ -1161,6 +1224,18 @@ class Driver:
                 cctl("charge_link",{"type":"value","readonly":True,"units":"%","title":"Coupling (charge vs setpoint)"})
                 self.mqtt.subscribe("/devices/%s/controls/+/on"%cd)
         # remove dashboards of absent modules (clear retained topics)
+        # Один номер корабля на двух включённых каналах = два разных радиолинка на один
+        # адрес. 24.08 boat1 и boat4 оба стояли на 9 (boat1 был выключен), и это стоило
+        # времени в разборе: приходилось доказывать, что говорим с тем бортом.
+        seen={}
+        for nm,ch in self.channels.items():
+            if not ch.enabled: continue
+            seen.setdefault(ch.lora["address"],[]).append(nm)
+        for a,who in seen.items():
+            if len(who)>1:
+                print("ВНИМАНИЕ: номер корабля %d стоит сразу на каналах %s — это два разных "
+                      "радиолинка на один адрес, диагностика станет неоднозначной"
+                      %(a,", ".join(sorted(who))),flush=True)
         for dev in getattr(self,"absent",[]):
             self.mqtt.publish("/devices/%s/meta"%dev,"",retain=True)
             self.mqtt.publish("/devices/%s/meta/name"%dev,"",retain=True)
