@@ -267,6 +267,36 @@ MOTOR_TITLE={n:_MT.get(n,n.replace("_"," ").title()) for n in MOTOR_NAMES}
 _LT={"nav_lights":"Navigation lights","morse_lamp":"Morse signal lamp","deck_lights":"Deck lights","cabin_light1":"Cabin light 1","cabin_light2":"Cabin light 2"}
 LIGHT_TITLE={n:_LT.get(n,n.replace("_"," ").title()) for n in LIGHT_NAMES}   # dashboard titles (nautical, English)
 KEEP_ON_RELEASE={"nav_lights"}   # что НЕ гасим, отпуская борт: ходовые огни горят и на брошенном катере
+_MO=M.get("morse",{}) or {}
+MORSE_CH=str(_MO.get("channel","morse_lamp"))   # какой световой канал работает морзянкой
+MORSE_TEXT=str(_MO.get("text","AHOY VOLGA"))
+MORSE_HZ=max(1,int(_MO.get("hz",2)))            # 1 Гц = период 1000 мс; меньше модуль не умеет
+MORSE_DOT=int(_MO.get("dot",20))                # скважность точки, %% -> вспышка dot*период/100
+MORSE_DASH=int(_MO.get("dash",60))              # скважность тире
+MORSE_LGAP=float(_MO.get("letter_gap",1.0))     # пауза между буквами, в периодах
+MORSE_WGAP=float(_MO.get("word_gap",3.0))       # пауза между словами, в периодах: скважность 0
+MORSE_CGAP=float(_MO.get("cycle_gap",4.0))      # пауза перед повтором всего сообщения
+MORSE_TABLE={"A":".-","B":"-...","C":"-.-.","D":"-..","E":".","F":"..-.","G":"--.","H":"....",
+  "I":"..","J":".---","K":"-.-","L":".-..","M":"--","N":"-.","O":"---","P":".--.","Q":"--.-",
+  "R":".-.","S":"...","T":"-","U":"..-","V":"...-","W":".--","X":"-..-","Y":"-.--","Z":"--..",
+  "0":"-----","1":".----","2":"..---","3":"...--","4":"....-","5":".....","6":"-....",
+  "7":"--...","8":"---..","9":"----."}
+def morse_plan(text):
+    """Текст -> список (скважность, сколько держать). Период один и тот же, меняется
+    только ширина: точка короткая вспышка, тире длинная, пауза — скважность 0."""
+    per=1.0/MORSE_HZ; out=[]
+    words=[w for w in str(text).upper().split() if w]
+    for wi,w in enumerate(words):
+        for ch in w:
+            code=MORSE_TABLE.get(ch)
+            if not code: continue          # чего нет в таблице — молча пропускаем
+            for sym in code: out.append((MORSE_DASH if sym=="-" else MORSE_DOT,per))
+            out.append((0,per*MORSE_LGAP))
+        if wi+1<len(words): out.append((0,per*MORSE_WGAP))
+    # Пауза перед повтором: без неё конец сообщения слипается с его началом,
+    # и на лампе не видно, где рисунок кончается.
+    if out: out.append((0,per*MORSE_CGAP))
+    return out
 # Телеметрия точки: (control, units, title). Один список на все дашборды — у корабля те же подписи, что у точки.
 BOAT_TELE=(("battery_current","A","Battery current"),("battery_temperature","°C","Battery temperature"),("charge_level","%","Charge level"),
            ("battery_voltage","V","Battery voltage"),("input_voltage","V","Input voltage"),("rssi","dBm","LoRa RSSI"),
@@ -363,6 +393,8 @@ class Channel(threading.Thread):
         self.sensor_fails=0; self.sensor_gone=False   # датчик курса стоит не на всех бортах -> после N неудач опрашиваем редко
         self.sensor_seen=False; self._sen_probe=0.0   # отвечал ли хоть раз на этом борту; когда последний раз переспрашивали
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
+        self.morse_on=False; self.morse_seq=[]; self.morse_i=0; self.morse_due=0.0
+        self._morse_freq=False   # стоит ли уже частота морзянки в канале (init/resume её сбивают на 400)
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
         self.apply_wiring()               # pick motor/light register map for this ship (by LoRa address)
@@ -542,6 +574,16 @@ class Channel(threading.Thread):
             else:
                 prev=self.motor.get(ctrl,INIT_MOTOR)
                 self.motor[ctrl]=want; self.pub(ctrl,thr_fmt(want)); self.set_thr(s,c,want,prev,ctrl)
+        elif ctrl==MORSE_CH and MORSE_CH in self.light_map:
+            # Этот канал — переключатель морзянки, а не ползунок яркости.
+            is_cmd=False   # свет и морзянка к ходу не относятся -> режим SAILING не взводят
+            on=(val in ("1","true","on")) or iv==1
+            if not self.online:
+                self.puberr(ctrl,"w"); self.pub(ctrl,1 if self.morse_on else 0)
+                print("[%s] команда ОТКЛОНЕНА: морзянка %s, борт не на связи (%s)"
+                      %(self.name,"ВКЛ" if on else "ВЫКЛ",self.mode),flush=True)
+            else:
+                self.puberr(ctrl,""); self.morse_set(on)
         elif ctrl in self.light_map:
             is_cmd=False   # свет не относится к ходу -> не взводит режим SAILING
             s,c=self.light_map[ctrl]; want=max(0,min(100,iv))
@@ -631,6 +673,11 @@ class Channel(threading.Thread):
         for n,s,c in self.motors: self.pub(n,thr_fmt(self.motor[n]))
         for n,s,c in self.lights: self.pub(n,self.light[n])
         self.mod_miss={k:0 for k in self.mod_miss}; self.faulted=set()
+        # Новый борт или ребут модуля -> морзянку гасим: её включали для ПРЕЖНЕГО борта,
+        # и молча продолжать мигать на новом неправильно.
+        if self.morse_on:
+            print("[%s] морзянка выключена: полная реинициализация борта"%self.name,flush=True)
+        self.morse_on=False; self._morse_freq=False
     def pwm_kept_state(self):
         # True, если все pwm-каналы всё ещё держат INIT_FREQ -> модули не теряли питание (был провал связи, не ребут)
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
@@ -639,6 +686,52 @@ class Channel(threading.Thread):
             for i,f in enumerate(r):
                 if not self.freq_sane(s,i+1,f): return False
         return True
+    def morse_set(self,on):
+        """Переключатель морзянки. Выключение гасит лампу И возвращает каналу штатные
+        400 Гц: иначе freq_check увидит 1 Гц и решит, что модуль ребутнулся."""
+        sc=self.light_map.get(MORSE_CH)
+        if sc is None:
+            print("[%s] морзянка: канала %s нет в разводке этого борта"%(self.name,MORSE_CH),flush=True)
+            return
+        s,c=sc
+        if on:
+            plan=morse_plan(MORSE_TEXT)
+            if not plan:
+                print("[%s] морзянка: из текста %r передавать нечего"%(self.name,MORSE_TEXT),flush=True)
+                self.morse_on=False; self.pub(MORSE_CH,0); return
+            self.morse_on=True; self.morse_seq=plan; self.morse_i=0
+            self.morse_due=0.0; self._morse_freq=False
+            per=1000.0/MORSE_HZ
+            print("[%s] морзянка ВКЛ на %s: «%s», %d Гц (период %.0f мс), точка %d%% (%.0f мс), "
+                  "тире %d%% (%.0f мс), символов в цикле %d"
+                  %(self.name,MORSE_CH,MORSE_TEXT,MORSE_HZ,per,MORSE_DOT,per*MORSE_DOT/100.0,
+                    MORSE_DASH,per*MORSE_DASH/100.0,len(plan)),flush=True)
+        else:
+            self.morse_on=False; self._morse_freq=False; self.light[MORSE_CH]=0
+            self.wr(s,DUTY_REG[c],0,MORSE_CH)
+            self.wr(s,FREQ_REG[c],LIGHT_FREQ,MORSE_CH)
+            print("[%s] морзянка ВЫКЛ: лампа погашена, частота канала обратно %d Гц"%(self.name,LIGHT_FREQ),flush=True)
+        self.pub(MORSE_CH,1 if self.morse_on else 0)
+    def morse_step(self):
+        """Один символ за раз, из общего цикла канала. Ничего не блокирует: держит
+        модуль, а мы только смотрим на часы и переписываем скважность."""
+        if not self.morse_on or not self.morse_seq: return
+        now=time.monotonic()
+        if now<self.morse_due: return
+        sc=self.light_map.get(MORSE_CH)
+        if sc is None: self.morse_on=False; return
+        s,c=sc
+        if not self._morse_freq:
+            # Порядок как везде: сначала снять выход, потом частота. init_ship и resume_ship
+            # возвращают каналу 400 Гц, поэтому флаг сбрасывается и частота ставится заново.
+            self.wr(s,DUTY_REG[c],0,MORSE_CH)
+            if not self.wr(s,FREQ_REG[c],MORSE_HZ,MORSE_CH): return   # не записалось — попробуем на следующем шаге
+            self._morse_freq=True
+        duty,dur=self.morse_seq[self.morse_i]
+        self.morse_i=(self.morse_i+1)%len(self.morse_seq)   # по кругу, пока не выключат
+        self.light[MORSE_CH]=duty
+        self.wr(s,DUTY_REG[c],duty,MORSE_CH)
+        self.morse_due=now+dur
     def motor_at(self,slave,ch):
         """Имя мотора на этом канале, иначе None. Ищем по списку, а не по кэшу:
         self.motors пересобирается при смене номера корабля, и кэш пережил бы
@@ -651,6 +744,11 @@ class Channel(threading.Thread):
         сверяем с полосой, а не с числом. У светового обязана быть ровно LIGHT_FREQ.
         Заводское значение после ребута — 1000 Гц, оно не проходит ни то, ни другое."""
         if self.motor_at(slave,ch) is not None: return FREQ_LO<=f<=FREQ_HI
+        if self.morse_on and self.light_map.get(MORSE_CH)==(slave,ch):
+            # Пока идёт морзянка, у этого канала частота НАМЕРЕННО низкая. Без этой
+            # оговорки freq_check счёл бы её признаком ребута модуля и форсировал бы
+            # полную реинициализацию с переармом моторов — на каждом круге проверки.
+            return f in (MORSE_HZ,LIGHT_FREQ)
         return f==LIGHT_FREQ
     def wblock(self,want,REG):
         # Записать {модуль:{канал:значение}} блоками (func16): 1 кадр на модуль вместо 3.
@@ -696,6 +794,7 @@ class Channel(threading.Thread):
     def resume_ship(self):
         # реконнект после короткого провала связи: модули живы, просто заново утверждаем последний заданный газ/свет — БЕЗ сброса в холостой
         self.push_duty()
+        self._morse_freq=False   # push_duty вернул каналу 400 Гц -> морзянка переставит свою частоту сама
         for n,s,c in self.motors: self.pub(n,thr_fmt(self.motor[n]))
         for n,s,c in self.lights: self.pub(n,self.light[n])
     def pub_comms(self):
@@ -868,6 +967,10 @@ class Channel(threading.Thread):
         for n,s,c in self.motors+self.lights:
             r=block.get(s)
             if r is None: ok=False; self.puberr(n,"r")
+            elif self.morse_on and n==MORSE_CH:
+                # Скважность этого канала меняется каждый период. Утверждать «заданное»
+                # тут нельзя: readback затёр бы текущий символ и сбил рисунок.
+                self.puberr(n,"")
             else:
                 hw=r[c-1]
                 if self.motor_at(s,c) is not None:
@@ -1012,6 +1115,7 @@ class Channel(threading.Thread):
                             if self.fails>=OFFLINE_FAILS:
                                 print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
                                 self.offline_since=now; self.online=False; self.set_mode(SEARCH)
+            self.morse_step()   # такт морзянки: один регистр, ничего не блокирует
             if not did: time.sleep(0.05)   # холостой шаг: 0.2 с добавляли столько же к задержке команды
 
 class ModbusTCP:
@@ -1245,7 +1349,9 @@ class Driver:
             for nm,u,t in BOAT_TELE:
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
             for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":int(THR_MAX),"title":MOTOR_TITLE[n2]})
-            for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
+            for n in LIGHT_NAMES:
+                if n==MORSE_CH: ctl(n,{"type":"switch","readonly":False,"title":"Morse"})
+                else: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
             ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"})
             ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"})
         else:
@@ -1285,7 +1391,9 @@ class Driver:
         mot=(lambda k: ch.motor.get(k,INIT_MOTOR)) if ch is not None else (lambda k: INIT_MOTOR)
         lit=(lambda k: ch.light.get(k,0)) if ch is not None else (lambda k: 0)
         for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":int(THR_MAX),"title":MOTOR_TITLE[n2]},mot(n2))
-        for n2 in LIGHT_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n2,n2)},lit(n2))
+        for n2 in LIGHT_NAMES:
+            if n2==MORSE_CH: ctl(n2,{"type":"switch","readonly":False,"title":"Morse"},1 if (ch is not None and ch.morse_on) else 0)
+            else: ctl(n2,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n2,n2)},lit(n2))
         ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"},0)
         ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"},0)
     def pt_channel(self,p): return self.channels.get("mod%d"%p) if p else None
