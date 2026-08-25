@@ -352,7 +352,14 @@ class Channel(threading.Thread):
         live=self.online
         lim=(tries or READ_TRIES) if live else 1
         for attempt in range(lim):
-            if attempt: time.sleep(READ_RETRY_GAP)            # пауза перед повтором (опоздавший по радио кадр не столкнётся)
+            if attempt:
+                # Газ важнее повтора телеметрии: если команда уже пришла, отдаём её ДО второй
+                # попытки, иначе она ждёт обе (2 x ~810 мс = до 1.66 с). Повтор при этом не
+                # отменяется, поэтому счётчики отказов модулей не врут. _txn перед записью
+                # сбрасывает входной буфер, так что вклиненная запись повтору не мешает.
+                if not self.q.empty(): self.drain()
+                if self.ser is None: return None              # канал закрыли командой enabled=0
+                time.sleep(READ_RETRY_GAP)                    # пауза перед повтором (опоздавший кадр не столкнётся)
             t0=time.monotonic()
             r=self._txn(req,need); t=time.monotonic()
             if live and stats: self._rd_att.append(t)         # учёт качества линка: сырая попытка
