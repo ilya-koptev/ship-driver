@@ -631,7 +631,8 @@ class Channel(threading.Thread):
         score=min(score,q_fail+20.0)   # реальные провалы всегда тянут вниз, даже при отличном сигнале
         self.pub("link_score",int(round(cl(score))))
     def poll_current(self):
-        r=self.read_regs(UPS,4,UPS_VIN,4)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat (input voltage rides along at the 5 s current rate)
+        q=self.absent(UPS)
+        r=self.read_regs(UPS,4,UPS_VIN,4,tries=1 if q else None,stats=not q)   # one block: regs 2..5 = Vin, Vout, Vbat, Ibat
         self.pub_comms()   # счётчики связи обновляем каждым опросом (учитывают и этот промах, если был)
         if r is None: self.puberr("battery_current","r"); self.puberr("battery_voltage","r"); self.puberr("input_voltage","r"); return False
         self.tele["current"]=s16(r[3])*0.001; self.pub("battery_current",round(self.tele["current"],3)); self.puberr("battery_current","")
@@ -640,12 +641,20 @@ class Channel(threading.Thread):
         self.pub("input_voltage",round(r[0]*0.001,2)); self.puberr("input_voltage","")
         if self.rssi is not None: self.pub("rssi",self.rssi); self.puberr("rssi","")   # обновлён чтением выше
         return True
+    def absent(self,slave):
+        """Устройство, которое драйвер УЖЕ признал отсутствующим: ИБП в отступе или модуль,
+        по которому объявлена авария. Его неответы не должны идти в метрику связи —
+        link_quality про радиоканал, а не про комплектацию борта. Опрашивать продолжаем
+        (устройство может появиться), но без повтора и без счётчиков."""
+        if slave==UPS: return getattr(self,"ups_quiet",0)>=UPS_QUIET_AFTER
+        return slave in getattr(self,"faulted",())
+
     def pwm_alive(self):   # ship reachable via pwm even when UPS is off — probe each pwm8a04 frequency register
         for s in PWM_SLAVES:
-            if self.read_regs(s,3,FREQ_REG[1],1) is not None: return True
+            if self.read_regs(s,3,FREQ_REG[1],1,tries=1,stats=False) is not None: return True   # зондирование живости, не телеметрия
         return False
     def poll_temp(self):
-        r=self.read_regs(UPS,4,UPS_TEMP,1)
+        r=self.read_regs(UPS,4,UPS_TEMP,1,tries=1 if self.absent(UPS) else None,stats=not self.absent(UPS))
         if r is None: self.puberr("battery_temperature","r"); return False
         self.tele["temp"]=s16(r[0])*0.01; self.pub("battery_temperature",round(self.tele["temp"],2)); self.puberr("battery_temperature","")
         if THERM_ON and self.mode==CHARGE: self.thermal_pid(self.tele["temp"])
@@ -685,7 +694,7 @@ class Channel(threading.Thread):
                 self.chg_setpoint=out; self.pub("charge_setpoint",out)
                 print("[%s] заряд: t=%.1f °C (прогноз %.1f, %+.2f °C/мин) -> ток %d мА"%(self.name,t,t+slope*TH_LEAD,slope,out),flush=True)
     def poll_charge(self):
-        r=self.read_regs(UPS,4,UPS_CHG,1)
+        r=self.read_regs(UPS,4,UPS_CHG,1,tries=1 if self.absent(UPS) else None,stats=not self.absent(UPS))
         if r is None: self.puberr("charge_level","r"); return False
         self.pub("charge_level",round(r[0]*0.01,1)); self.puberr("charge_level",""); return True
     def poll_course(self):
@@ -737,7 +746,8 @@ class Channel(threading.Thread):
         # read-back of all motors+lights via ONE block per pwm8a04 (regs 112..114 = ch1/2/3), then distribute
         ok=True; block={}
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
-            block[s]=self.read_regs(s,3,DUTY_REG[1],3)   # DUTY_REG[1]=112 -> [ch1,ch2,ch3]
+            a=self.absent(s)
+            block[s]=self.read_regs(s,3,DUTY_REG[1],3,tries=1 if a else None,stats=not a)   # 112..114 = ch1/2/3
         for n,s,c in self.motors+self.lights:
             r=block.get(s)
             if r is None: ok=False; self.puberr(n,"r")
@@ -759,7 +769,8 @@ class Channel(threading.Thread):
         # Поэтому форсируем ПОЛНУЮ реинициализацию: online=False -> SEARCH переловит
         # модуль и вызовет init_ship (freq=400 + переарм ESC + холостой 40).
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
-            r=self.read_regs(s,3,FREQ_REG[1],3)   # FREQ_REG[1]=0 -> [ch1,ch2,ch3]
+            a=self.absent(s)
+            r=self.read_regs(s,3,FREQ_REG[1],3,tries=1 if a else None,stats=not a)   # FREQ_REG[1]=0 -> ch1/2/3
             if r is None:
                 # раньше тут был молчаливый continue: навсегда пропавший модуль не поднимал
                 # ничего, кроме meta/error="r" на своих контролах (случай 24.08: модуль 11
