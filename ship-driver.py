@@ -127,9 +127,15 @@ def deep_merge(base,over):
         if isinstance(v,dict) and isinstance(base.get(k),dict): deep_merge(base[k],v)
         else: base[k]=v
     return base
+def strip_comments(txt):
+    """Снять строки-комментарии // из конфига. json.load их не понимает, и конфиг
+    с пояснениями молча уезжал в DEFAULTS — без единого слова в журнале, кроме
+    невнятного 'Expecting property name'. Рвём только строки, которые ЦЕЛИКОМ
+    комментарий: // внутри значения (например в url) остаётся на месте."""
+    return "\n".join("" if ln.lstrip().startswith("//") else ln for ln in txt.split("\n"))
 def load_conf():
     base=json.loads(json.dumps(DEFAULTS))
-    try: deep_merge(base,json.load(open(CONF_FILE)))
+    try: deep_merge(base,json.loads(strip_comments(open(CONF_FILE,encoding="utf-8").read())))
     except FileNotFoundError: pass
     except Exception as e: print("conf load err (using defaults):",e,flush=True)
     return base
@@ -148,7 +154,25 @@ _LK=M["charge"].get("link",{})
 LK_VOPEN=float(_LK.get("v_open_v",12.7)); LK_REFF=float(_LK.get("r_eff_ohm",0.35))
 LK_DEVFULL=float(_LK.get("dev_full_v",2.0)); LK_SMOOTH=int(_LK.get("smooth",5))
 INIT_FREQ=M["init"]["freq"]; INIT_MOTOR=M["init"]["motor"]; INIT_LIGHT=M["init"]["light"]
-MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]
+MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]   # ПРЕЖНЯЯ шкала скважности, больше не действует
+THR_MAX=float(M["limits"].get("throttle_max",100))        # делений ползунка газа: 0 = выхода нет, 1 = холостой, THR_MAX = полный
+PULSE_IDLE=float(M["limits"].get("pulse_idle_us",1000.0)) # импульс на делении 1 (прежняя скважность 40 при 400 Гц)
+PULSE_TOP=float(M["limits"].get("pulse_top_us",2000.0))   # импульс на верхнем делении (прежняя скважность 80)
+MOTOR_DUTY=int(M["limits"].get("motor_duty",60))          # скважность моторных каналов ПОСТОЯННА: газ несёт частота
+LIGHT_FREQ=INIT_FREQ                                      # у света газ по-прежнему скважность, частота 400 Гц
+def thr_us(t):
+    """Деление ползунка -> длительность импульса, мкс. 0 = выхода нет совсем."""
+    if t<=0: return 0.0
+    if THR_MAX<=1: return PULSE_IDLE
+    return PULSE_IDLE+(PULSE_TOP-PULSE_IDLE)*(min(t,THR_MAX)-1)/(THR_MAX-1)
+def thr_freq(t):
+    """Деление -> частота, Гц. Зависимость обратная: больше газ = ниже частота."""
+    us=thr_us(t)
+    return 0 if us<=0 else int(round(MOTOR_DUTY*1e4/us))
+FREQ_HI=thr_freq(1); FREQ_LO=thr_freq(THR_MAX)   # рабочая полоса частот газа; вне неё = модуль ребутнулся
+def thr_fmt(t):
+    """Целое печатаем целым: ползунок homeui не любит 12.0."""
+    return int(t) if float(t)==int(t) else round(float(t),2)
 MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardcoded
 RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
@@ -446,6 +470,15 @@ class Channel(threading.Thread):
         if ctrl: self.puberr(ctrl,"w")
         return False
 
+    def set_thr(self,slave,ch,t,prev,ctrl):
+        """Газ одним моторным каналом. Ноль — снятие выхода совсем (ESC теряет сигнал).
+        Иначе меняем ЧАСТОТУ; рабочую скважность досылаем только если её там не было,
+        поэтому обычная команда — по-прежнему один кадр и прежняя задержка."""
+        if t<=0: return self.wr(slave,DUTY_REG[ch],0,ctrl)
+        if not self.wr(slave,FREQ_REG[ch],thr_freq(t),ctrl): return False
+        if prev>0: return True
+        return self.wr(slave,DUTY_REG[ch],MOTOR_DUTY,ctrl)
+
     # ---- command handling (this thread) ----
     def handle(self,ctrl,val):
         try: fv=float(val)
@@ -458,15 +491,18 @@ class Channel(threading.Thread):
                 self.release_ship()   # пока связь ещё есть: газ в холостой, свет и звук долой
                 self.online=False; self.set_mode(OFF); self.close()
         elif ctrl in self.motor_map:
-            s,c=self.motor_map[ctrl]; want=max(MOTOR_MIN,min(MOTOR_MAX,iv))
+            # Ползунок газа 0..THR_MAX. Дробные значения принимаем: железо различает
+            # ~2.4 мкс, то есть примерно четверть деления, и терять это незачем.
+            s,c=self.motor_map[ctrl]; want=max(0.0,min(THR_MAX,fv))
             if not self.online:
                 # раньше команда тут молча исчезала. Отказ теперь ЯВНЫЙ, но желаемое
                 # в self.motor НЕ пишем: иначе resume_ship на реконнекте выдал бы этот
                 # газ в железо до арминга ESC (рывок), а decide() показал бы SAILING.
-                is_cmd=False; self.puberr(ctrl,"w"); self.pub(ctrl,self.motor.get(ctrl,INIT_MOTOR))
-                print("[%s] команда ОТКЛОНЕНА: %s=%d, борт не на связи (%s)"%(self.name,ctrl,want,self.mode),flush=True)
+                is_cmd=False; self.puberr(ctrl,"w"); self.pub(ctrl,thr_fmt(self.motor.get(ctrl,INIT_MOTOR)))
+                print("[%s] команда ОТКЛОНЕНА: %s=%g, борт не на связи (%s)"%(self.name,ctrl,want,self.mode),flush=True)
             else:
-                self.motor[ctrl]=want; self.pub(ctrl,want); self.wr(s,DUTY_REG[c],want,ctrl)
+                prev=self.motor.get(ctrl,INIT_MOTOR)
+                self.motor[ctrl]=want; self.pub(ctrl,thr_fmt(want)); self.set_thr(s,c,want,prev,ctrl)
         elif ctrl in self.light_map:
             is_cmd=False   # свет не относится к ходу -> не взводит режим SAILING
             s,c=self.light_map[ctrl]; want=max(0,min(100,iv))
@@ -539,33 +575,64 @@ class Channel(threading.Thread):
     # ---- ship logic ----
     def init_ship(self):
         self.sensor_fails=0; self.sensor_gone=False   # новый борт -> заново проверяем наличие датчика курса
-        print("[%s] init_ship ship=%d: freq=%d, motors->idle(%d), lights->%d"%(self.name,self.lora["address"],INIT_FREQ,INIT_MOTOR,INIT_LIGHT),flush=True)
+        print("[%s] init_ship ship=%d: газ 0..%g частотой %d..%d Гц при скважности %d%%, моторы в холостой (%g = %.0f мкс), свет %d"
+              %(self.name,self.lora["address"],THR_MAX,FREQ_LO,FREQ_HI,MOTOR_DUTY,INIT_MOTOR,thr_us(INIT_MOTOR),INIT_LIGHT),flush=True)
         # Блочно (func16): по одному кадру на модуль вместо трёх — было 18 транзакций на инициализацию, стало 6.
         for s in PWM_SLAVES: self.write_regs(s,DUTY_REG[1],[0,0,0])             # 1) power (duty) off on every channel first
-        for s in PWM_SLAVES: self.write_regs(s,FREQ_REG[1],[INIT_FREQ]*3)      # 2) then pwm frequency = 400
+        # 2) частоты: моторным каналам — частота холостого газа, световым — 400 Гц.
+        #    Регистры 0..2 подряд, так что это по-прежнему один кадр на модуль.
+        fr={}
+        for sl in PWM_SLAVES: fr[sl]={c:LIGHT_FREQ for c in (1,2,3)}
+        for n2,sl,c in self.motors: fr[sl][c]=thr_freq(INIT_MOTOR)
+        for sl in PWM_SLAVES: self.write_regs(sl,FREQ_REG[1],[fr[sl][c] for c in (1,2,3)])
         for n,s,c in self.motors: self.motor[n]=INIT_MOTOR
         for n,s,c in self.lights: self.light[n]=INIT_LIGHT
         self.push_duty()                                                        # 3) моторы в холостой + свет — блоками по модулям
-        for n,s,c in self.motors: self.pub(n,self.motor[n])
+        for n,s,c in self.motors: self.pub(n,thr_fmt(self.motor[n]))
         for n,s,c in self.lights: self.pub(n,self.light[n])
         self.mod_miss={k:0 for k in self.mod_miss}; self.faulted=set()
     def pwm_kept_state(self):
         # True, если все pwm-каналы всё ещё держат INIT_FREQ -> модули не теряли питание (был провал связи, не ребут)
         for s in sorted(set([sl for _,sl,_ in self.motors]+[sl for _,sl,_ in self.lights])):
             r=self.read_regs(s,3,FREQ_REG[1],3)
-            if r is None or any(f!=INIT_FREQ for f in r): return False
+            if r is None: return False
+            for i,f in enumerate(r):
+                if not self.freq_sane(s,i+1,f): return False
         return True
-    def push_duty(self):
-        # Разложить желаемые скважности по модулям и записать блоками (func16): 1 кадр на модуль вместо 3.
-        want={}
-        for n,s,c in self.motors: want.setdefault(s,{})[c]=self.motor[n]
-        for n,s,c in self.lights: want.setdefault(s,{})[c]=self.light[n]
+    def motor_at(self,slave,ch):
+        """Имя мотора на этом канале, иначе None. Ищем по списку, а не по кэшу:
+        self.motors пересобирается при смене номера корабля, и кэш пережил бы
+        прежний борт. Моторов четыре, перебор дешевле любой синхронизации."""
+        for nm,sl,c in self.motors:
+            if sl==slave and c==ch: return nm
+        return None
+    def freq_sane(self,slave,ch,f):
+        """Частота выглядит нашей? У моторного канала она гуляет вместе с газом, поэтому
+        сверяем с полосой, а не с числом. У светового обязана быть ровно LIGHT_FREQ.
+        Заводское значение после ребута — 1000 Гц, оно не проходит ни то, ни другое."""
+        if self.motor_at(slave,ch) is not None: return FREQ_LO<=f<=FREQ_HI
+        return f==LIGHT_FREQ
+    def wblock(self,want,REG):
+        # Записать {модуль:{канал:значение}} блоками (func16): 1 кадр на модуль вместо 3.
         for s,chans in want.items():
             cs=sorted(chans)
             if cs==list(range(cs[0],cs[0]+len(cs))):                     # каналы подряд -> один кадр
-                self.write_regs(s,DUTY_REG[cs[0]],[chans[c] for c in cs])
+                self.write_regs(s,REG[cs[0]],[chans[c] for c in cs])
             else:
-                for c in cs: self.write_reg(s,DUTY_REG[c],chans[c])      # с дырой — поштучно
+                for c in cs: self.write_reg(s,REG[c],chans[c])           # с дырой — поштучно
+    def push_duty(self):
+        # Разложить желаемое по модулям. У моторного канала газ несёт ЧАСТОТА при постоянной
+        # скважности, у светового — наоборот. Порядок для моторов обязателен: скважность 0 ->
+        # частота -> рабочая скважность. Иначе новая частота ложится на СТАРУЮ скважность и
+        # даёт выброс импульса — 25.08 так вышел лишний пуск на 1675 мкс.
+        duty={}; mzero={}; mfreq={}
+        for n,s,c in self.motors:
+            t=self.motor[n]
+            duty.setdefault(s,{})[c]=MOTOR_DUTY if t>0 else 0
+            mzero.setdefault(s,{})[c]=0
+            mfreq.setdefault(s,{})[c]=thr_freq(max(1,t))   # при нулевом газе ставим частоту холостого
+        for n,s,c in self.lights: duty.setdefault(s,{})[c]=self.light[n]
+        self.wblock(mzero,DUTY_REG); self.wblock(mfreq,FREQ_REG); self.wblock(duty,DUTY_REG)
     def release_ship(self):
         # Уходим от борта (переключились на другой или выключили точку) — оставляем его в безопасном виде:
         # газ в холостой, свет погашен кроме ходовых огней, звук выключен. Без этого брошенный катер
@@ -580,7 +647,7 @@ class Channel(threading.Thread):
         self.push_duty()
         try: self.send_mp3(mp3_frame(MP3["stop"]))
         except Exception as e: print("[%s] звук не выключился: %s"%(self.name,e),flush=True)
-        for n,_,_ in self.motors: self.pub(n,self.motor[n])
+        for n,_,_ in self.motors: self.pub(n,thr_fmt(self.motor[n]))
         for n,_,_ in self.lights: self.pub(n,self.light[n])
         self.pub("mp3_track",0)
         print("[%s] отпускаю борт %d: газ в холостой, свет погашен (кроме %s), звук выкл"
@@ -589,7 +656,7 @@ class Channel(threading.Thread):
     def resume_ship(self):
         # реконнект после короткого провала связи: модули живы, просто заново утверждаем последний заданный газ/свет — БЕЗ сброса в холостой
         self.push_duty()
-        for n,s,c in self.motors: self.pub(n,self.motor[n])
+        for n,s,c in self.motors: self.pub(n,thr_fmt(self.motor[n]))
         for n,s,c in self.lights: self.pub(n,self.light[n])
     def pub_comms(self):
         # скользящее окно COMMS_WIN. Ключевое различие:
@@ -752,7 +819,18 @@ class Channel(threading.Thread):
             r=block.get(s)
             if r is None: ok=False; self.puberr(n,"r")
             else:
-                hw=r[c-1]; want=(self.motor if n in self.motor else self.light).get(n)
+                hw=r[c-1]
+                if self.motor_at(s,c) is not None:
+                    # У мотора скважность постоянна (газ несёт частота): сверяем её, а на
+                    # ползунок отдаём деление газа — железное значение оператору бессмысленно.
+                    t=self.motor.get(n,0); wd=MOTOR_DUTY if t>0 else 0
+                    if hw!=wd:
+                        print("[%s] %s: скважность в железе %d, должна быть %d -> переписываю"%(self.name,n,hw,wd),flush=True)
+                        self.wr(s,DUTY_REG[c],wd,n)
+                    else:
+                        self.pub(n,thr_fmt(t)); self.puberr(n,"")
+                    continue
+                want=self.light.get(n)
                 # Раньше сюда публиковалось железное значение, а self.motor не менялся:
                 # ползунок показывал одно, драйвер считал другое, decide() давал IDLE при
                 # видимом газе. Хозяин — драйвер: при расхождении утверждаем своё.
@@ -780,10 +858,17 @@ class Channel(threading.Thread):
                 continue
             self.mod_miss[s]=0; self.faulted.discard(s)
             for i,f in enumerate(r):
-                if f!=INIT_FREQ:
-                    print("[%s] pwm addr %d ch%d freq drift %d->%d: модуль ребутнулся -> форсирую реинициализацию (переарм ESC)"%(self.name,s,i+1,f,INIT_FREQ),flush=True)
+                if not self.freq_sane(s,i+1,f):
+                    print("[%s] pwm addr %d ch%d частота %d вне рабочего вида: модуль ребутнулся -> форсирую реинициализацию (переарм ESC)"%(self.name,s,i+1,f),flush=True)
                     self.online=False; self.fails=0; self.due={}; self.offline_since=time.monotonic()   # -> run(): SEARCH -> init_ship переармит ESC и вернёт холостой
                     return True
+                nm=self.motor_at(s,i+1)
+                if nm is None: continue
+                t=self.motor.get(nm,0)
+                if t>0 and f!=thr_freq(t):
+                    # Частота в полосе, но не наша: газ в железе не тот, что задан. Хозяин — драйвер.
+                    print("[%s] %s: в железе %d Гц, задано %d Гц (газ %g) -> переписываю"%(self.name,nm,f,thr_freq(t),t),flush=True)
+                    self.wr(s,FREQ_REG[i+1],thr_freq(t),nm)
         return True
     def module_fault(self,slave):
         """Модуль не отвечает совсем: его каналы неуправляемы, идти с этим нельзя.
@@ -799,7 +884,7 @@ class Channel(threading.Thread):
             if sl==slave: continue                 # его каналы всё равно не пишутся
             self.motor[nm]=INIT_MOTOR
             self.wr(sl,DUTY_REG[c],INIT_MOTOR,nm)
-            self.pub(nm,INIT_MOTOR)
+            self.pub(nm,thr_fmt(INIT_MOTOR))
 
     GROUPS={"current":"poll_current","temp":"poll_temp","charge":"poll_charge","pwm_readback":"poll_pwm_readback","freq_check":"poll_freq_check","course":"poll_course"}
     def decide(self):
@@ -1109,7 +1194,7 @@ class Driver:
         if full:
             for nm,u,t in BOAT_TELE:
                 ctl(nm,{"type":"value","readonly":True,"units":u,"title":t})
-            for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]})
+            for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":int(THR_MAX),"title":MOTOR_TITLE[n2]})
             for n in LIGHT_NAMES: ctl(n,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n,n)})
             ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"})
             ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"})
@@ -1149,7 +1234,7 @@ class Driver:
         ch=self.channel_for_ship(n)
         mot=(lambda k: ch.motor.get(k,INIT_MOTOR)) if ch is not None else (lambda k: INIT_MOTOR)
         lit=(lambda k: ch.light.get(k,0)) if ch is not None else (lambda k: 0)
-        for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":MOTOR_MIN,"max":MOTOR_MAX,"title":MOTOR_TITLE[n2]},mot(n2))
+        for n2 in MOTOR_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":int(THR_MAX),"title":MOTOR_TITLE[n2]},mot(n2))
         for n2 in LIGHT_NAMES: ctl(n2,{"type":"range","readonly":False,"min":0,"max":100,"title":LIGHT_TITLE.get(n2,n2)},lit(n2))
         ctl("mp3_track",{"type":"range","readonly":False,"min":0,"max":MP3_TRACK_MAX,"title":"Audio track"},0)
         ctl("mp3_volume",{"type":"range","readonly":False,"min":0,"max":MP3_VOL_MAX,"title":"Volume"},0)
