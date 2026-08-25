@@ -194,6 +194,15 @@ FREQ_HI=thr_freq(1); FREQ_LO=thr_freq(THR_MAX)   # рабочая полоса �
 def thr_fmt(t):
     """Целое печатаем целым: ползунок homeui не любит 12.0."""
     return int(t) if float(t)==int(t) else round(float(t),2)
+# Холостой газ, который выдаёт тягу, намеренным не бывает: это значение, оставшееся
+# от прежней шкалы скважности 40..80 (там 40 и означало холостой). В новой шкале
+# деление 40 это 1277 мкс — при init_ship борт получил бы настоящий газ, с винтами
+# в воде. Чиним сами и говорим об этом: молча ехать с таким конфигом нельзя.
+if INIT_MOTOR>1 and thr_us(INIT_MOTOR)>PULSE_START:
+    print("КОНФИГ: init.motor=%g даёт импульс %.0f мкс — это не холостой ход, а газ. "
+          "Похоже, значение осталось от прежней шкалы скважности 40..80. Ставлю 1 (%.0f мкс)."
+          %(INIT_MOTOR,thr_us(INIT_MOTOR),PULSE_IDLE),flush=True)
+    INIT_MOTOR=1
 MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardcoded
 RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
