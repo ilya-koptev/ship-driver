@@ -1308,6 +1308,16 @@ class Driver:
         # роняет соединение -> драйвер уходит в бесконечный цикл переподключений и молчит. Логируем сами.
         # ВАЖНО: публикация в устройство, которого нет в ACL порта 1883 (/etc/mosquitto/acl/ship.conf),
         # для MQTT 3.1.1 = отключение клиента брокером. Новое устройство -> сначала строка в ACL.
+        now=time.monotonic()
+        self._conn_at=[t for t in getattr(self,"_conn_at",[]) if now-t<60.0]+[now]
+        if len(self._conn_at)>=4:   # брокер рвёт клиента молча, драйвер только переподключается
+            devs=[ch.dev for ch in self.channels.values()]+["ship%d"%x for x in SHIP_NUMBERS]+                 ["ship_setup","ship_diag","ship_bus","pwm_setup"]
+            if self.chargerbus is not None:
+                devs+= [self.chargerbus.dev(i) for i in range(len(self.chargerbus.chargers))]
+            print("ВНИМАНИЕ: %d переподключений к брокеру за минуту. Обычная причина — устройство, "
+                  "которого нет в /etc/mosquitto/acl/ship.conf: публикация в тему вне ACL для MQTT 3.1.1 "
+                  "означает отключение клиента (в журнале mosquitto это «Quota exceeded»). Нужны строки "
+                  "topic readwrite /devices/<имя>/# для: %s"%(len(self._conn_at),", ".join(devs)),flush=True)
         try:
             self.declare()
             print("declare: точки %s, корабли %s"%(sorted(self.channels),SHIP_NUMBERS),flush=True)
