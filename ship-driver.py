@@ -55,8 +55,8 @@ for _n,(_tty,_g) in _profile.items():
     if _num is None: print("WARN: config-GPIO line '%s' (%s) not found"%(_g,_n),flush=True)
     CHANNELS[_n]=(_tty,_num)
 print("board=%s channels=%s"%(BOARD,{n:(t,g) for n,(t,g) in CHANNELS.items()}),flush=True)
-PWM_ADDR_REG=253; PWM_BAUD_REG=254   # PWM8A04: регистр адреса и код скорости (3 = 9600) — установлено 11.08 на живых модулях
-PWM_SETUP_CONTROLS=["address","new_address","read","write","found_address","baud_code","freq","duty","status"]
+PWM_ADDR_REG=253   # PWM8A04: регистр адреса устройства — установлено 11.08 на живых модулях (рядом, в 254, лежит код скорости: 3 = 9600)
+PWM_SETUP_CONTROLS=["address","new_address","read","write","found_address","status"]
 RS485="/dev/ttyRS485-1"   # Ship Setup dashboard: wired ship LoRa-modem config (ship modem in config mode by its switch)
 STATE_FILE="/etc/ship-driver-state.json"   # persist per-channel enabled across reboot
 CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
@@ -1248,9 +1248,6 @@ class Driver:
              getattr(self,"pwm_addr",1))
         pctl("read",{"type":"pushbutton","title":"Read"})
         pctl("found_address",{"type":"value","readonly":True,"title":"Address in module (reg 253)"},"")
-        pctl("baud_code",{"type":"value","readonly":True,"title":"Baud code (reg 254)"},"")
-        pctl("freq",{"type":"text","readonly":True,"title":"Frequency ch1/2/3"},"")
-        pctl("duty",{"type":"text","readonly":True,"title":"Duty ch1/2/3"},"")
         pctl("new_address",{"type":"value","readonly":False,"min":1,"max":247,"title":"New address"},"")
         pctl("write",{"type":"pushbutton","title":"Write address"})
         pctl("status",{"type":"text","readonly":True,"title":"Result"},"")
@@ -1389,20 +1386,14 @@ class Driver:
             st("читаю адрес %d..."%a)
             try:
                 ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
-                try:
-                    adr=self._mb(ser,a,3,PWM_ADDR_REG,1); bd=self._mb(ser,a,3,PWM_BAUD_REG,1)
-                    fq=self._mb(ser,a,3,0,3);             dt=self._mb(ser,a,3,112,3)
+                try: adr=self._mb(ser,a,3,PWM_ADDR_REG,1)
                 finally: ser.close()
             except Exception as e: st("ERR %s"%e); return
             if adr is None:
-                for c in ("found_address","baud_code","freq","duty"): pp(c,"")
+                pp("found_address","")
                 st("ERR адрес %d молчит. Модуль под питанием? Тот ли адрес? Голова в режиме сетап?"%a); return
-            pp("found_address",adr[0]); pp("baud_code",bd[0] if bd else "")
-            pp("freq"," / ".join(map(str,fq)) if fq else "")
-            pp("duty"," / ".join(map(str,dt)) if dt else "")
-            st("OK адрес=%d, скорость=%s, частоты=%s, скважности=%s"
-               %(adr[0], ("%d (9600)"%bd[0] if bd and bd[0]==3 else (str(bd[0]) if bd else "?")),
-                 fq if fq else "-", dt if dt else "-"))
+            pp("found_address",adr[0])
+            st("OK на адресе %d в регистре адреса %d"%(a,adr[0]))
             return
         if ctrl=="write":
             nw=getattr(self,"pwm_new",0)
