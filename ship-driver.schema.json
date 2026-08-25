@@ -316,6 +316,70 @@
               "minimum": 0,
               "maximum": 30,
               "propertyOrder": 4
+            },
+            "motor_duty": {
+              "type": "integer",
+              "title": "Скважность моторов, %",
+              "description": "Постоянна: газ несёт частота, а не скважность. Импульс = скважность*1e4/f.",
+              "minimum": 1,
+              "maximum": 99,
+              "propertyOrder": 5
+            },
+            "throttle_max": {
+              "type": "integer",
+              "title": "Делений газа",
+              "description": "Ползунок 0..N. 0 — выход снят совсем, 1 — холостой, N — полный.",
+              "minimum": 2,
+              "maximum": 1000,
+              "propertyOrder": 6
+            },
+            "pulse_idle_us": {
+              "type": "integer",
+              "title": "Импульс холостого, мкс",
+              "description": "Деление 1. ESC взведён, вал стоит.",
+              "minimum": 500,
+              "maximum": 3000,
+              "propertyOrder": 7
+            },
+            "pulse_start_us": {
+              "type": "integer",
+              "title": "Импульс страгивания, мкс",
+              "description": "Деление 2. МЕРИТСЯ НА КАЖДОЙ УСТАНОВКЕ (tools/thr-current.py): под нагрузкой порог выше, чем на столе.",
+              "minimum": 500,
+              "maximum": 3000,
+              "propertyOrder": 8
+            },
+            "pulse_top_us": {
+              "type": "integer",
+              "title": "Импульс полного газа, мкс",
+              "description": "Верхнее деление ползунка.",
+              "minimum": 500,
+              "maximum": 3000,
+              "propertyOrder": 9
+            },
+            "throttle_gamma": {
+              "type": "number",
+              "title": "Крутизна кривой газа",
+              "description": "1.0 — линейно по импульсу. Больше — мельче внизу, крупнее вверху. Круче ~1.5 деления начинают давать одну частоту.",
+              "minimum": 0.5,
+              "maximum": 3.0,
+              "propertyOrder": 10
+            },
+            "stop_idle_s": {
+              "type": "number",
+              "title": "Холостой перед снятием выхода, с",
+              "description": "Сброс в 0 сначала даёт холостой импульс (ESC исполняет сразу), и лишь потом гасит выход.",
+              "minimum": 0,
+              "maximum": 10,
+              "propertyOrder": 11
+            },
+            "stop_tries": {
+              "type": "integer",
+              "title": "Попыток подтвердить останов",
+              "description": "Нулевая скважность подтверждается чтением регистра; столько раз повторяем.",
+              "minimum": 1,
+              "maximum": 20,
+              "propertyOrder": 12
             }
           },
           "options": {
@@ -383,6 +447,22 @@
               "title": "Период в SERVICE, с",
               "minimum": 0,
               "propertyOrder": 7
+            },
+            "sensor_giveup": {
+              "type": "integer",
+              "title": "Неответов датчика до «его нет»",
+              "description": "«Датчика на борту нет» решается ТОЛЬКО про тот, который не ответил ни разу. Отвечал — опрос продолжается.",
+              "minimum": 1,
+              "maximum": 100,
+              "propertyOrder": 9
+            },
+            "sensor_retry_s": {
+              "type": "number",
+              "title": "Переспрашивать отсутствующий датчик, с",
+              "description": "Признанный отсутствующим переспрашивается с этим периодом и возвращается сам.",
+              "minimum": 5,
+              "maximum": 3600,
+              "propertyOrder": 10
             }
           }
         },
@@ -419,6 +499,73 @@
           },
           "options": {
             "collapsed": true
+          }
+        },
+        "morse": {
+          "type": "object",
+          "title": "Морзянка",
+          "_format": "grid",
+          "propertyOrder": 7,
+          "description": "Световой канал работает переключателем: символ кодируется ШИРИНОЙ импульса при низкой частоте. Форму держит модуль. Минимум частоты у pwm8a04 — 1 Гц.",
+          "options": {
+            "collapsed": true
+          },
+          "properties": {
+            "channel": {
+              "type": "string",
+              "title": "Канал",
+              "description": "Имя светового канала из разводки борта.",
+              "propertyOrder": 1
+            },
+            "text": {
+              "type": "string",
+              "title": "Текст",
+              "description": "Латиница и цифры; чего нет в таблице — пропускается.",
+              "propertyOrder": 2
+            },
+            "hz": {
+              "type": "integer",
+              "title": "Частота, Гц",
+              "description": "Период = 1/Гц. Минимум, который принимает модуль, — 1 Гц.",
+              "minimum": 1,
+              "maximum": 50,
+              "propertyOrder": 3
+            },
+            "dot": {
+              "type": "integer",
+              "title": "Точка, % скважности",
+              "minimum": 1,
+              "maximum": 99,
+              "propertyOrder": 4
+            },
+            "dash": {
+              "type": "integer",
+              "title": "Тире, % скважности",
+              "minimum": 1,
+              "maximum": 99,
+              "propertyOrder": 5
+            },
+            "letter_gap": {
+              "type": "number",
+              "title": "Пауза между буквами, периодов",
+              "minimum": 0,
+              "maximum": 20,
+              "propertyOrder": 6
+            },
+            "word_gap": {
+              "type": "number",
+              "title": "Пауза между словами, периодов",
+              "minimum": 0,
+              "maximum": 60,
+              "propertyOrder": 7
+            },
+            "cycle_gap": {
+              "type": "number",
+              "title": "Пауза перед повтором, периодов",
+              "minimum": 0,
+              "maximum": 60,
+              "propertyOrder": 8
+            }
           }
         }
       }
