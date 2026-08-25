@@ -474,7 +474,13 @@ class Channel(threading.Thread):
         """Газ одним моторным каналом. Ноль — снятие выхода совсем (ESC теряет сигнал).
         Иначе меняем ЧАСТОТУ; рабочую скважность досылаем только если её там не было,
         поэтому обычная команда — по-прежнему один кадр и прежняя задержка."""
-        if t<=0: return self.wr(slave,DUTY_REG[ch],0,ctrl)
+        if t<=0:
+            # Сначала снять выход, потом вернуть частоту холостого: покой должен
+            # выглядеть ОДИНАКОВО, откуда бы в него ни пришли. Замер 25.08: без этого
+            # в модуле оставалась частота прежнего газа (464 Гц после деления 30), и
+            # «газ 0» читался в регистрах по-разному в зависимости от предыстории.
+            ok=self.wr(slave,DUTY_REG[ch],0,ctrl)
+            return self.wr(slave,FREQ_REG[ch],thr_freq(1),ctrl) and ok
         if not self.wr(slave,FREQ_REG[ch],thr_freq(t),ctrl): return False
         if prev>0: return True
         return self.wr(slave,DUTY_REG[ch],MOTOR_DUTY,ctrl)
