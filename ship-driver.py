@@ -160,6 +160,8 @@ PULSE_IDLE=float(M["limits"].get("pulse_idle_us",1000.0)) # импульс на 
 PULSE_TOP=float(M["limits"].get("pulse_top_us",2000.0))   # импульс на верхнем делении (прежняя скважность 80)
 PULSE_START=float(M["limits"].get("pulse_start_us",1047.0)) # импульс на делении 2: измеренная точка страгивания
 THR_GAMMA=float(M["limits"].get("throttle_gamma",1.5))    # 1.0 = линейно по импульсу; больше = мельче внизу, крупнее вверху
+STOP_IDLE_S=float(M["limits"].get("stop_idle_s",1.0))     # сколько держать холостой импульс, прежде чем гасить выход совсем
+STOP_TRIES=int(M["limits"].get("stop_tries",6))           # столько раз пытаемся подтвердить нулевую скважность
 MOTOR_DUTY=int(M["limits"].get("motor_duty",60))          # скважность моторных каналов ПОСТОЯННА: газ несёт частота
 LIGHT_FREQ=INIT_FREQ                                      # у света газ по-прежнему скважность, частота 400 Гц
 def thr_us(t):
@@ -394,6 +396,7 @@ class Channel(threading.Thread):
         self.sensor_seen=False; self._sen_probe=0.0   # отвечал ли хоть раз на этом борту; когда последний раз переспрашивали
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.morse_on=False; self.morse_seq=[]; self.morse_i=0; self.morse_due=0.0
+        self.cut={}   # (модуль,канал) -> [когда гасить, контрол, сколько попыток осталось]
         self._morse_freq=False   # стоит ли уже частота морзянки в канале (init/resume её сбивают на 400)
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
@@ -540,12 +543,16 @@ class Channel(threading.Thread):
         Иначе меняем ЧАСТОТУ; рабочую скважность досылаем только если её там не было,
         поэтому обычная команда — по-прежнему один кадр и прежняя задержка."""
         if t<=0:
-            # Сначала снять выход, потом вернуть частоту холостого: покой должен
-            # выглядеть ОДИНАКОВО, откуда бы в него ни пришли. Замер 25.08: без этого
-            # в модуле оставалась частота прежнего газа (464 Гц после деления 30), и
-            # «газ 0» читался в регистрах по-разному в зависимости от предыстории.
-            ok=self.wr(slave,DUTY_REG[ch],0,ctrl)
-            return self.wr(slave,FREQ_REG[ch],thr_freq(1),ctrl) and ok
+            # Ноль снимает сигнал СОВСЕМ, а регулятор без входа выключается по своему
+            # failsafe-таймауту — секундами позже. Разбор 25.08: отказов записи скважности
+            # в журнале нет ни одного, то есть дело было не в записи. Поэтому сначала даём
+            # явный холостой импульс («минимум», регулятор исполняет его сразу), и только
+            # через STOP_IDLE_S гасим выход. Заодно покой выглядит одинаково, откуда бы в
+            # него ни пришли: частота холостого ставится здесь же.
+            self.wr(slave,FREQ_REG[ch],thr_freq(1),ctrl)
+            ok=self.wr(slave,DUTY_REG[ch],MOTOR_DUTY,ctrl)
+            self.cut[(slave,ch)]=[time.monotonic()+STOP_IDLE_S,ctrl,STOP_TRIES]
+            return ok
         if not self.wr(slave,FREQ_REG[ch],thr_freq(t),ctrl): return False
         if prev>0: return True
         return self.wr(slave,DUTY_REG[ch],MOTOR_DUTY,ctrl)
@@ -673,6 +680,7 @@ class Channel(threading.Thread):
         for n,s,c in self.motors: self.pub(n,thr_fmt(self.motor[n]))
         for n,s,c in self.lights: self.pub(n,self.light[n])
         self.mod_miss={k:0 for k in self.mod_miss}; self.faulted=set()
+        self.cut={}   # реинициализация сама расставляет холостой: доканчивать прежние остановы нечего
         # Новый борт или ребут модуля -> морзянку гасим: её включали для ПРЕЖНЕГО борта,
         # и молча продолжать мигать на новом неправильно.
         if self.morse_on:
@@ -686,6 +694,30 @@ class Channel(threading.Thread):
             for i,f in enumerate(r):
                 if not self.freq_sane(s,i+1,f): return False
         return True
+    def cut_step(self):
+        """Второй шаг останова: погасить выход после того, как регулятор получил
+        холостой. Подтверждаем чтением — «записал» и «стало нулём» это разные
+        утверждения, и на их смешивании я уже обжигался."""
+        if not self.cut: return
+        now=time.monotonic()
+        for key in list(self.cut):
+            due,ctrl,left=self.cut[key]
+            if now<due: continue
+            s,c=key
+            if self.motor.get(ctrl,0)>0:
+                del self.cut[key]; continue        # газ успели дать заново — гасить нечего
+            self.wr(s,DUTY_REG[c],0,ctrl)
+            r=self.read_regs(s,3,DUTY_REG[c],1,tries=1,stats=False)
+            if r is not None and r[0]==0:
+                del self.cut[key]; continue        # подтверждено
+            left-=1
+            if left<=0:
+                print("[%s] ОСТАНОВ НЕ ПОДТВЕРЖДЁН: %s, скважность в железе %s вместо 0 после %d попыток. "
+                      "Мотор оставлен на холостом импульсе — вал стоит, но выход не снят."
+                      %(self.name,ctrl,"нет ответа" if r is None else r[0],STOP_TRIES),flush=True)
+                self.puberr(ctrl,"w")
+                del self.cut[key]; continue
+            self.cut[key]=[now+0.3,ctrl,left]
     def morse_set(self,on):
         """Переключатель морзянки. Выключение гасит лампу И возвращает каналу штатные
         400 Гц: иначе freq_check увидит 1 Гц и решит, что модуль ребутнулся."""
@@ -1115,6 +1147,7 @@ class Channel(threading.Thread):
                             if self.fails>=OFFLINE_FAILS:
                                 print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
                                 self.offline_since=now; self.online=False; self.set_mode(SEARCH)
+            self.cut_step()     # добить останов: погасить выход после холостого импульса
             self.morse_step()   # такт морзянки: один регистр, ничего не блокирует
             if not did: time.sleep(0.05)   # холостой шаг: 0.2 с добавляли столько же к задержке команды
 
