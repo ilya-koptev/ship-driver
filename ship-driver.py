@@ -65,6 +65,9 @@ UPS=10; UPS_VIN=2; UPS_CUR=5; UPS_CHG=8; UPS_TEMP=9; UPS_CHG_SETPOINT=18   # UPS
 # WT901C485 (JY-901): один блок 0x34..0x54 = 33 регистра за ОДНУ транзакцию (~220 мс) —
 # ускорения, гироскоп, магнитометр, углы, температура и кватернионы. Смещения внутри блока:
 IMU_BASE=0x34; IMU_LEN=33
+IMU_SHORT=13          # 0x34..0x40: ускорения, гироскоп, магнитометр, углы, температура — всё, что на дашборде
+IMU_Q_BASE=0x51       # кватернионы лежат отдельно, за 16 неиспользуемыми регистрами
+IMU_Q_PERIOD=60.0     # они нужны для разбора по логам, а не для дашборда -> берём редко
 IMU_ACC=0; IMU_GYR=3; IMU_MAG=6; IMU_ANG=9; IMU_TEMP=12; IMU_Q=29   # 0x51..0x54 -> индекс 29
 ACC_SCALE=16.0/32768.0; GYR_SCALE=2000.0/32768.0; ANG_SCALE=180.0/32768.0; Q_SCALE=1.0/32768.0
 IMU_PUB=["accel_x","accel_y","accel_z","gyro_x","gyro_y","gyro_z","mag_x","mag_y","mag_z",
@@ -297,6 +300,7 @@ class Channel(threading.Thread):
         # значит первый выход на связь = полный init_ship. Иначе resume_ship записал бы нули как «желаемый» газ.
         self.force_init=True                # также ставится при осознанной смене корабля
         self.f16=None                       # поддержка Modbus func16 (блочная запись): None=не пробовали, True/False=выяснено
+        self._q_at=0.0                                # когда последний раз читали кватернионы
         self.sensor_fails=0; self.sensor_gone=False   # датчик курса стоит не на всех бортах -> после N неудач перестаём опрашивать
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
@@ -328,7 +332,9 @@ class Channel(threading.Thread):
             extra=self.ser.read(1)                  # он пришёл вплотную к кадру -> уже в буфере, берётся мгновенно
             if len(extra)==1: self.rssi=-(256-extra[0])   # E220: dBm = -(256 - байт)
         return buf   # кадр возвращаем БЕЗ RSSI-байта — read_regs/write_reg не меняются
-    def read_regs(self,slave,func,addr,n):
+    def read_regs(self,slave,func,addr,n,tries=None,stats=True):
+        # tries=1 и stats=False — для НЕобязательной телеметрии (датчик курса):
+        # повтор ей не нужен, а её промахи не должны портить метрики связи борта.
         # Диагностика природы отказов: каждая неудачная попытка классифицируется.
         #   to    — не пришло НИ БАЙТА (пакет потерян целиком) -> подпись радио
         #   short — пришёл обрывок кадра                        -> фрейминг/тайминги
@@ -340,27 +346,30 @@ class Channel(threading.Thread):
         # В SEARCH (борт не на связи) неответ — это НЕ ошибка связи, а «борта здесь нет»:
         # не повторяем (зря занимали бы эфир вдвое) и не засоряем ни счётчики, ни журнал.
         live=self.online
-        for attempt in range(READ_TRIES if live else 1):
+        lim=(tries or READ_TRIES) if live else 1
+        for attempt in range(lim):
             if attempt: time.sleep(READ_RETRY_GAP)            # пауза перед повтором (опоздавший по радио кадр не столкнётся)
             t0=time.monotonic()
             r=self._txn(req,need); t=time.monotonic()
-            if live: self._rd_att.append(t)                   # учёт качества линка: сырая попытка
+            if live and stats: self._rd_att.append(t)         # учёт качества линка: сырая попытка
             if len(r)==0: kind="to"
             elif len(r)<need: kind="short"
             elif r[0]!=slave or r[1]!=func or r[2]!=2*n: kind="hdr"
             elif crc16(r[:3+2*n])!=r[3+2*n:5+2*n]: kind="crc"
             else:
-                self._lat.append((t,(t-t0)*1000.0))
-                if attempt: self._rd_retry_ok.append(t)       # промах вылечен повтором
+                if stats:
+                    self._lat.append((t,(t-t0)*1000.0))
+                    if attempt: self._rd_retry_ok.append(t)   # промах вылечен повтором
                 return [ (r[3+2*i]<<8)|r[4+2*i] for i in range(n) ]
             if live:                                          # промахи зондирования в SEARCH не считаем и не логируем
-                self._rd_miss.append(t)
-                self._rd_kind[kind].append(t)
+                if stats:
+                    self._rd_miss.append(t)
+                    self._rd_kind[kind].append(t)
                 if DIAG_LOG:
                     print("[%s] промах чтения: тип=%s slave=%d reg=%d n=%d попытка=%d/%d ждал=%.0fмс rssi=%s байт=%d %s"
-                          %(self.name,kind,slave,addr,n,attempt+1,READ_TRIES,(t-t0)*1000.0,
+                          %(self.name,kind,slave,addr,n,attempt+1,lim,(t-t0)*1000.0,
                             self.rssi,len(r),r[:12].hex() if r else ""),flush=True)
-        if live: self._rd_fail.append(time.monotonic())        # отказ после всех попыток = «настоящая» ошибка
+        if live and stats: self._rd_fail.append(time.monotonic())   # отказ после всех попыток = «настоящая» ошибка
         return None
     def write_regs(self,slave,addr,vals):
         # Modbus func 16 — несколько ПОДРЯД идущих регистров одним кадром (вместо N кадров по func 6).
@@ -675,14 +684,21 @@ class Channel(threading.Thread):
         sen=getattr(self,"sensor",SENSOR_FALLBACK)
         if not sen.get("enabled",True) or self.sensor_gone: return True
         addr=int(sen.get("address",14))
-        r=self.read_regs(addr,3,IMU_BASE,IMU_LEN)
-        if r is None: r=self.read_regs(addr,3,IMU_BASE,13)   # откат: без кватернионов (иная прошивка/вариант)
+        # Читаем КОРОТКИЙ блок 0x34..0x40. Раньше читался один блок из 33 регистров: он тащил
+        # 16 неиспользуемых регистров (0x41..0x50) только чтобы одной транзакцией достать
+        # кватернионы, и падал примерно в 5 % чтений. Разбор 25.08 по журналу за 48 ч: 482 отказа
+        # чтения 33 регистров, из них 435 (90 %) сразу лечились чтением 13 — то есть дело было в
+        # длине, а не в датчике. Каждый отказ стоил 4 транзакции по ~810 мс = ~3.2 с занятого
+        # канала, из-за чего мигали красным и посторонние контролы.
+        r=self.read_regs(addr,3,IMU_BASE,IMU_SHORT,tries=1,stats=False)
         if r is None:
             self.sensor_fails+=1
             if self.sensor_fails>=SENSOR_GIVEUP:
                 self.sensor_gone=True
-                for c in IMU_PUB: self.puberr(c,"")
-                print("[%s] датчик (адрес %d) не отвечает %d раз -> опрос выключен для этого борта"%(self.name,addr,self.sensor_fails),flush=True)
+                # Пометку НЕ снимаем: опрос выключен, значения застыли. Раньше здесь стоял
+                # puberr(c,"") и course выглядел живым, хотя его уже никто не обновлял.
+                for c in IMU_PUB: self.puberr(c,"r")
+                print("[%s] датчик (адрес %d) не отвечает %d раз -> опрос выключен для этого борта, значения застыли"%(self.name,addr,self.sensor_fails),flush=True)
             else:
                 for c in IMU_PUB: self.puberr(c,"r")
             return False
@@ -698,8 +714,12 @@ class Channel(threading.Thread):
         elif yaw>180: yaw-=360
         self.pub("roll",round(roll,2)); self.pub("pitch",round(pitch,2)); self.pub("course",round(yaw,1))
         if len(r)>IMU_TEMP: self.pub("sensor_temp",round(g(IMU_TEMP)*0.01,1))
-        if len(r)>=IMU_Q+4:
-            for i in range(4): self.pub("q%d"%i,round(g(IMU_Q+i)*Q_SCALE,4))
+        now=time.monotonic()                       # кватернионы — своим коротким чтением и редко
+        if now-self._q_at>=IMU_Q_PERIOD:
+            self._q_at=now
+            q=self.read_regs(addr,3,IMU_Q_BASE,4,tries=1,stats=False)
+            if q is not None:
+                for i in range(4): self.pub("q%d"%i,round(s16(q[i])*Q_SCALE,4))
         for c in IMU_PUB: self.puberr(c,"")
         return True
     def poll_pwm_readback(self):
