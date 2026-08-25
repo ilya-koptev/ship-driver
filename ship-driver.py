@@ -157,6 +157,8 @@ SENSOR_GIVEUP=3   # столько неудач подряд -> считаем, 
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
 COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
+UPS_QUIET_AFTER=int(M["rates"].get("ups_quiet_after",3))          # столько неответов ИБП подряд -> опрашивать его редко
+UPS_QUIET_PERIOD=float(M["rates"].get("ups_quiet_period",60.0))   # ИБП стоит не на каждой голове; молчащий не должен занимать канал
 LOST_MISSES=int(M["rates"].get("lost_misses",6))   # столько неответов подряд по ОДНОМУ модулю = авария: идти с этим нельзя
 DIAG_LOG=True     # писать в журнал строку на каждый промах чтения (тип/slave/RSSI/байты) — для разбора природы ошибок
 FREQ_BASE=850.125; SPED_BASE=0x60; OPTION_BASE=0x60   # band base + E220 SPED/OPTION base bytes (UART 9600, subpkt128, RSSI) — fixed
@@ -835,7 +837,21 @@ class Channel(threading.Thread):
                 if fn is None: continue                     # unknown group -> skip, don't crash the channel thread
                 if now>=self.due.get(g,0):
                     ok=getattr(self,fn)(); self.due[g]=now+per; did=True
+                    # Команда не должна ждать конца телеметрии. Один неответ = 2 попытки по ~810 мс,
+                    # то есть до 1.6 с занятого канала, а очередь раньше разбиралась только в начале
+                    # цикла. Замер 25.08: на стенде без ИБП газ приходил с медианой 844 мс и до 2.2 с,
+                    # на борту с живым ИБП — 159 мс.
+                    self.drain()
                     if g=="current":
+                        if ok:
+                            self.ups_quiet=0
+                        else:
+                            self.ups_quiet=getattr(self,"ups_quiet",0)+1
+                            if self.ups_quiet==UPS_QUIET_AFTER:
+                                print("[%s] ИБП (адрес %d) не ответил %d раз -> опрашиваю его раз в %.0f с, "
+                                      "чтобы он не занимал канал (на голове ИБП может не стоять)"
+                                      %(self.name,UPS,self.ups_quiet,UPS_QUIET_PERIOD),flush=True)
+                            if self.ups_quiet>=UPS_QUIET_AFTER: self.due[g]=now+UPS_QUIET_PERIOD
                         if ok or self.pwm_alive(): self.fails=0   # UPS may be off; ship still alive if any pwm8a04 answers
                         else:
                             self.fails+=1
@@ -843,7 +859,7 @@ class Channel(threading.Thread):
                             if self.fails>=OFFLINE_FAILS:
                                 print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
                                 self.offline_since=now; self.online=False; self.set_mode(SEARCH)
-            if not did: time.sleep(0.2)
+            if not did: time.sleep(0.05)   # холостой шаг: 0.2 с добавляли столько же к задержке команды
 
 class ModbusTCP:
     # Modbus-RTU framed over a transparent TCP serial-gateway (e.g. EBYTE): same RTU frames + CRC16, sent over a socket.
