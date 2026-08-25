@@ -55,6 +55,8 @@ for _n,(_tty,_g) in _profile.items():
     if _num is None: print("WARN: config-GPIO line '%s' (%s) not found"%(_g,_n),flush=True)
     CHANNELS[_n]=(_tty,_num)
 print("board=%s channels=%s"%(BOARD,{n:(t,g) for n,(t,g) in CHANNELS.items()}),flush=True)
+PWM_ADDR_REG=253; PWM_BAUD_REG=254   # PWM8A04: регистр адреса и код скорости (3 = 9600) — установлено 11.08 на живых модулях
+PWM_SETUP_CONTROLS=["address","new_address","read","write","found_address","baud_code","freq","duty","status"]
 RS485="/dev/ttyRS485-1"   # Ship Setup dashboard: wired ship LoRa-modem config (ship modem in config mode by its switch)
 STATE_FILE="/etc/ship-driver-state.json"   # persist per-channel enabled across reboot
 CONF_FILE="/etc/ship-driver.conf"          # tunable settings (see DEFAULTS)
@@ -232,7 +234,7 @@ SHIP_MIRROR=set(["mode"]+[t[0] for t in SHIP_TELE]+SHIP_CMD)
 SHIP_CONTROLS=["radio_point","active","mode"]+[t[0] for t in SHIP_TELE]+SHIP_CMD   # для сноса устройства при остановке
 BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","charge_setpoint","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
-SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply"]   # ship_setup dashboard controls (for teardown on shutdown)
+SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply","LoRa_status"]   # ship_setup dashboard controls (for teardown on shutdown)
 
 MP3={"play":0x08,"vol":0x06,"pause":0x0E,"resume":0x0D,"stop":0x16,"next":0x01,"prev":0x02}
 def mp3_frame(cmd,param=0): return bytes([0x7E,0xFF,0x06,cmd,0x00,(param>>8)&0xFF,param&0xFF,0xEF])
@@ -1227,7 +1229,32 @@ class Driver:
         sctl("LoRa_raw",{"type":"text","readonly":True,"title":"raw (9 bytes)"},"")
         sctl("LoRa_default",{"type":"text","readonly":True,"title":"LoRa default"},LORA_DEFAULT_RAW)
         sctl("LoRa_read",{"type":"pushbutton","title":"Read"}); sctl("LoRa_apply",{"type":"pushbutton","title":"Write"})
+        sctl("LoRa_status",{"type":"text","readonly":True,"title":"Result"},"")   # исход последнего Read/Write словами
         self.mqtt.subscribe("/devices/%s/controls/+/on"%sd)
+
+        # ---- PWM8A04 Setup (RS485-1): начальная настройка модулей по проводу ----
+        # Свежий модуль приходит с заводским адресом 1. Читаем регистр адреса (253) по
+        # выбранному адресу, потом задаём новый. Регистры частот и скважностей читаются
+        # заодно — по ним видно, что на адресе действительно PWM8A04, а не что-то другое.
+        pd="pwm_setup"
+        self.setname(pd,"PWM8A04 Setup (RS485-1)")
+        po=[0]
+        def pctl(name,meta,val=None):
+            po[0]+=1; m=dict(meta,order=po[0])
+            if isinstance(m.get("title"),str): m["title"]={"en":m["title"],"ru":m["title"]}
+            self.pub_ctrl_meta(pd,name,m)
+            if val is not None: self.mqtt.publish("/devices/%s/controls/%s"%(pd,name),str(val),retain=True)
+        pctl("address",{"type":"value","readonly":False,"min":1,"max":247,"title":"Address to talk to"},
+             getattr(self,"pwm_addr",1))
+        pctl("read",{"type":"pushbutton","title":"Read"})
+        pctl("found_address",{"type":"value","readonly":True,"title":"Address in module (reg 253)"},"")
+        pctl("baud_code",{"type":"value","readonly":True,"title":"Baud code (reg 254)"},"")
+        pctl("freq",{"type":"text","readonly":True,"title":"Frequency ch1/2/3"},"")
+        pctl("duty",{"type":"text","readonly":True,"title":"Duty ch1/2/3"},"")
+        pctl("new_address",{"type":"value","readonly":False,"min":1,"max":247,"title":"New address"},"")
+        pctl("write",{"type":"pushbutton","title":"Write address"})
+        pctl("status",{"type":"text","readonly":True,"title":"Result"},"")
+        self.mqtt.subscribe("/devices/%s/controls/+/on"%pd)
         # ---- charging stations (chargerN dashboards) ----
         if self.chargerbus is not None:
             for i,ch in enumerate(self.chargerbus.chargers):
@@ -1270,6 +1297,7 @@ class Driver:
                 for ch in self.channels.values(): self.clear_device(ch.dev,BOAT_CONTROLS)
                 for n in SHIP_NUMBERS: self.clear_device("ship%d"%n,SHIP_CONTROLS)
                 self.clear_device("ship_setup",SETUP_CONTROLS)
+                self.clear_device("pwm_setup",PWM_SETUP_CONTROLS)
                 if self.chargerbus is not None:
                     for i in range(len(self.chargerbus.chargers)): self.clear_device(self.chargerbus.dev(i),CHARGER_CONTROLS)
                 time.sleep(0.6)   # let the retained clears flush before we exit
@@ -1289,6 +1317,7 @@ class Driver:
     def on_message(self,c,u,msg):
         p=msg.topic.split("/"); dev=p[2]; ctrl=p[4]; val=msg.payload.decode(errors="ignore").strip()
         if dev=="ship_setup": self.setupq.put((ctrl,val)); return
+        if dev=="pwm_setup": self.setupq.put(("pwm:"+ctrl,val)); return   # та же очередь: RS485-1 один, доступ к нему последовательный
         if dev.startswith("charger") and self.chargerbus is not None: self.chargerbus.q.put((dev,ctrl,val)); return
         if dev.startswith("ship") and dev[4:].isdigit():
             # команда с вкладки борта -> на ту точку, где борт сейчас стоит
@@ -1308,6 +1337,7 @@ class Driver:
             try: self.handle_setup(ctrl,val)
             except Exception as e: print("setup err",ctrl,e,flush=True)
     def handle_setup(self,ctrl,val):
+        if ctrl.startswith("pwm:"): return self.pwm_setup_op(ctrl[4:],val)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
         if ctrl=="ship_number":
             try: self.setup_number=int(float(val))
@@ -1319,9 +1349,79 @@ class Driver:
             sp("LoRa_channel",self.setup_channel); sp("LoRa_freq",round(FREQ_BASE+self.setup_channel,3)); sp("LoRa_grkch",grkch(self.setup_channel))
         elif ctrl=="LoRa_read": self.setup_op(False)           # read connected ship modem -> show all params
         elif ctrl=="LoRa_apply": self.setup_op(True)           # write number+channel (and full dump) to the connected modem
+    # ---- PWM8A04 Setup (RS485-1): начальная настройка модулей по проводу ----
+    def _mb(self,ser,slave,func,reg,val_or_n):
+        """Одна Modbus-транзакция по проводу. func 3 = чтение val_or_n регистров, 6 = запись значения."""
+        f=bytes([slave,func,(reg>>8)&0xFF,reg&0xFF,(val_or_n>>8)&0xFF,val_or_n&0xFF]); f+=crc16(f)
+        ser.reset_input_buffer(); ser.write(f); ser.flush(); time.sleep(0.15)
+        need=(5+2*val_or_n) if func==3 else 8
+        r=ser.read(need+4)
+        if func==6: return r if (len(r)>=8 and r[0]==slave and r[1]==6) else None
+        if len(r)<3+2*val_or_n or r[0]!=slave or r[1]!=3: return None
+        d=r[3:3+2*val_or_n]
+        return [(d[i]<<8)|d[i+1] for i in range(0,len(d),2)]
+
+    def pwm_setup_op(self,ctrl,val):
+        """Свежий PWM8A04 приходит с заводским адресом 1. Регистр 253 — адрес, 254 — код
+        скорости (3 = 9600). Адрес применяется сразу, и модуль при этом перезагружается,
+        теряя ранее выставленные частоты и скважности — драйвер их всё равно ставит при init."""
+        pp=lambda c,v: self.mqtt.publish("/devices/pwm_setup/controls/%s"%c,str(v),retain=True)
+        def st(v):
+            print("[pwm_setup] %s"%v,flush=True); pp("status",v)
+        try: iv=int(float(val))
+        except Exception: iv=0
+        if ctrl=="address":
+            self.pwm_addr=max(1,min(247,iv)); pp("address",self.pwm_addr); return
+        if ctrl=="new_address":
+            self.pwm_new=max(1,min(247,iv)); pp("new_address",self.pwm_new); return
+        a=getattr(self,"pwm_addr",1)
+        if ctrl=="read":
+            st("читаю адрес %d..."%a)
+            try:
+                ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
+                try:
+                    adr=self._mb(ser,a,3,PWM_ADDR_REG,1); bd=self._mb(ser,a,3,PWM_BAUD_REG,1)
+                    fq=self._mb(ser,a,3,0,3);             dt=self._mb(ser,a,3,112,3)
+                finally: ser.close()
+            except Exception as e: st("ERR %s"%e); return
+            if adr is None:
+                for c in ("found_address","baud_code","freq","duty"): pp(c,"")
+                st("ERR адрес %d молчит. Модуль под питанием? Тот ли адрес? Голова в режиме сетап?"%a); return
+            pp("found_address",adr[0]); pp("baud_code",bd[0] if bd else "")
+            pp("freq"," / ".join(map(str,fq)) if fq else "")
+            pp("duty"," / ".join(map(str,dt)) if dt else "")
+            st("OK адрес=%d, скорость=%s, частоты=%s, скважности=%s"
+               %(adr[0], ("%d (9600)"%bd[0] if bd and bd[0]==3 else (str(bd[0]) if bd else "?")),
+                 fq if fq else "-", dt if dt else "-"))
+            return
+        if ctrl=="write":
+            nw=getattr(self,"pwm_new",0)
+            if not 1<=nw<=247: st("ERR сначала задай новый адрес (1..247)"); return
+            if nw==a: st("ERR новый адрес совпадает с текущим"); return
+            st("пишу адрес %d -> %d..."%(a,nw))
+            try:
+                ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
+                try:
+                    echo=self._mb(ser,a,6,PWM_ADDR_REG,nw)
+                    time.sleep(1.0)                          # адрес применяется сразу, модуль перезагружается
+                    chk=self._mb(ser,nw,3,PWM_ADDR_REG,1)    # проверяем УЖЕ на новом адресе
+                    old=self._mb(ser,a,3,PWM_ADDR_REG,1)     # старый должен замолчать
+                finally: ser.close()
+            except Exception as e: st("ERR %s"%e); return
+            if chk and chk[0]==nw:
+                self.pwm_addr=nw; pp("address",nw); pp("found_address",nw)
+                st("OK адрес %d принят%s (эхо %s)"%(nw,
+                   ", старый замолчал" if old is None else ", но СТАРЫЙ ЕЩЁ ОТВЕЧАЕТ — на адресе %d был не один модуль"%a,
+                   echo.hex() if echo else "нет"))
+            else:
+                st("ERR на новом адресе %d ответа нет (эхо %s). Модуль мог не принять запись."
+                   %(nw, echo.hex() if echo else "нет"))
+            return
+
     def setup_op(self,write):   # write=False -> read connected ship modem; write=True -> program number+channel (full dump) then read back
-        st=lambda v: print("[ship_setup] %s"%v,flush=True)
         sp=lambda c,v: self.mqtt.publish("/devices/ship_setup/controls/%s"%c,str(v),retain=True)
+        def st(v):   # раньше исход уходил только в журнал: оператор жал Read и не видел НИЧЕГО
+            print("[ship_setup] %s"%v,flush=True); sp("LoRa_status",v)
         st("запись..." if write else "чтение...")
         try:
             ser=serial.Serial(RS485,9600,8,"N",1,timeout=0.8)
