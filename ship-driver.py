@@ -158,7 +158,6 @@ MOTOR_MIN=M["limits"]["motor_min"]; MOTOR_MAX=M["limits"]["motor_max"]   # ПР�
 THR_MAX=float(M["limits"].get("throttle_max",100))        # делений ползунка газа: 0 = выхода нет, 1 = холостой, THR_MAX = полный
 PULSE_IDLE=float(M["limits"].get("pulse_idle_us",1000.0)) # импульс на делении 1 (прежняя скважность 40 при 400 Гц)
 PULSE_TOP=float(M["limits"].get("pulse_top_us",2000.0))   # импульс на верхнем делении (прежняя скважность 80)
-PULSE_START=float(M["limits"].get("pulse_start_us",1050.0)) # импульс на делении 2 = страгивание; ниже мотор не крутится
 THR_GAMMA=float(M["limits"].get("throttle_gamma",1.5))    # 1.0 = линейно по импульсу; больше = мельче внизу, крупнее вверху
 MOTOR_DUTY=int(M["limits"].get("motor_duty",60))          # скважность моторных каналов ПОСТОЯННА: газ несёт частота
 LIGHT_FREQ=INIT_FREQ                                      # у света газ по-прежнему скважность, частота 400 Гц
@@ -167,17 +166,20 @@ def thr_us(t):
 
       0        выхода нет совсем
       1        холостой (PULSE_IDLE): ESC взведён, вал стоит
-      2        страгивание (PULSE_START) — ниже мотор всё равно не крутится
       THR_MAX  полный (PULSE_TOP)
 
-    Между 2 и THR_MAX — степенная кривая: x**THR_GAMMA, где x это доля пройденного
-    ползунка. При THR_GAMMA=1 получается прежняя линейная шкала, больше единицы —
-    мельче внизу и крупнее вверху, потому что ходят в основном внизу.
-    Дробные значения между 1 и 2 смысла не имеют: это стык «стоит / пошёл»."""
+    Между 1 и THR_MAX — степенная кривая: x**THR_GAMMA, где x это доля пройденного
+    ползунка. При THR_GAMMA=1 получается линейная шкала, больше единицы — мельче
+    внизу и крупнее вверху, потому что ходят в основном внизу.
+
+    Мёртвую зону (низ, где вал ещё стоит) кривая НЕ перескакивает: где именно мотор
+    страгивается, не измерено — прежняя оценка «скважность 42», то есть 1050 мкс,
+    имеет неопределённость в целое деление прежней шкалы, 25 мкс. Пока не померено,
+    допущений не делаем."""
     if t<=0: return 0.0
-    if t<2 or THR_MAX<=2: return PULSE_IDLE
-    x=(min(t,THR_MAX)-2.0)/(THR_MAX-2.0)
-    return PULSE_START+(PULSE_TOP-PULSE_START)*(x**THR_GAMMA)
+    if THR_MAX<=1: return PULSE_IDLE
+    x=max(0.0,(min(t,THR_MAX)-1.0)/(THR_MAX-1.0))
+    return PULSE_IDLE+(PULSE_TOP-PULSE_IDLE)*(x**THR_GAMMA)
 def thr_freq(t):
     """Деление -> частота, Гц. Зависимость обратная: больше газ = ниже частота."""
     us=thr_us(t)
@@ -594,8 +596,8 @@ class Channel(threading.Thread):
     # ---- ship logic ----
     def init_ship(self):
         self.sensor_fails=0; self.sensor_gone=False   # новый борт -> заново проверяем наличие датчика курса
-        print("[%s] init_ship ship=%d: газ 0..%g частотой %d..%d Гц при скважности %d%% (кривая gamma=%g, страгивание %.0f мкс), моторы в холостой (%g = %.0f мкс), свет %d"
-              %(self.name,self.lora["address"],THR_MAX,FREQ_LO,FREQ_HI,MOTOR_DUTY,THR_GAMMA,PULSE_START,INIT_MOTOR,thr_us(INIT_MOTOR),INIT_LIGHT),flush=True)
+        print("[%s] init_ship ship=%d: газ 0..%g частотой %d..%d Гц при скважности %d%% (кривая gamma=%g), моторы в холостой (%g = %.0f мкс), свет %d"
+              %(self.name,self.lora["address"],THR_MAX,FREQ_LO,FREQ_HI,MOTOR_DUTY,THR_GAMMA,INIT_MOTOR,thr_us(INIT_MOTOR),INIT_LIGHT),flush=True)
         # Блочно (func16): по одному кадру на модуль вместо трёх — было 18 транзакций на инициализацию, стало 6.
         for s in PWM_SLAVES: self.write_regs(s,DUTY_REG[1],[0,0,0])             # 1) power (duty) off on every channel first
         # 2) частоты: моторным каналам — частота холостого газа, световым — 400 Гц.
