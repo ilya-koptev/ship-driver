@@ -207,7 +207,8 @@ MP3_TRACK_MAX=M["limits"]["mp3_track_max"]; MP3_VOL_MAX=30   # max volume hardco
 RATES={CHARGE:M["rates"]["CHARGING"], SAIL:M["rates"]["SAILING"], IDLE:M["rates"]["IDLE"]}
 SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fails"]
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
-SENSOR_GIVEUP=3   # столько неудач подряд -> считаем, что на этом борту датчика нет, и перестаём его дёргать
+SENSOR_GIVEUP=int(M["rates"].get("sensor_giveup",10))   # столько неудач подряд БЕЗ ЕДИНОГО ответа -> считаем, что датчика на борту нет
+SENSOR_RETRY_PERIOD=float(M["rates"].get("sensor_retry_s",60.0))   # как часто переспрашивать признанный отсутствующим
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
 COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
@@ -359,7 +360,8 @@ class Channel(threading.Thread):
         self.force_init=True                # также ставится при осознанной смене корабля
         self.f16=None                       # поддержка Modbus func16 (блочная запись): None=не пробовали, True/False=выяснено
         self._q_at=0.0                                # когда последний раз читали кватернионы
-        self.sensor_fails=0; self.sensor_gone=False   # датчик курса стоит не на всех бортах -> после N неудач перестаём опрашивать
+        self.sensor_fails=0; self.sensor_gone=False   # датчик курса стоит не на всех бортах -> после N неудач опрашиваем редко
+        self.sensor_seen=False; self._sen_probe=0.0   # отвечал ли хоть раз на этом борту; когда последний раз переспрашивали
         self.motor={n:0 for n in MOTOR_NAMES}; self.light={n:0 for n in LIGHT_NAMES}
         self.due={}
         self.lora=dict(LORA_PLAN[name])   # {channel,air_rate,address,power} from conf; refreshed by reading the modem at start
@@ -368,6 +370,7 @@ class Channel(threading.Thread):
         self.motors,self.motor_map,self.lights,self.sensor=wiring_for(self.lora["address"])
         self.light_map={n:(s,c) for n,s,c in self.lights}
         self.sensor_fails=0; self.sensor_gone=False   # сменилась разводка/борт -> заново проверяем датчик
+        self.sensor_seen=False; self._sen_probe=0.0
 
     # ---- serial / modbus ----
     def open(self):
@@ -611,6 +614,7 @@ class Channel(threading.Thread):
     # ---- ship logic ----
     def init_ship(self):
         self.sensor_fails=0; self.sensor_gone=False   # новый борт -> заново проверяем наличие датчика курса
+        self.sensor_seen=False; self._sen_probe=0.0
         print("[%s] init_ship ship=%d: газ 0..%g частотой %d..%d Гц при скважности %d%% (кривая gamma=%g, страгивание %.0f мкс), моторы в холостой (%g = %.0f мкс), свет %d"
               %(self.name,self.lora["address"],THR_MAX,FREQ_LO,FREQ_HI,MOTOR_DUTY,THR_GAMMA,PULSE_START,INIT_MOTOR,thr_us(INIT_MOTOR),INIT_LIGHT),flush=True)
         # Блочно (func16): по одному кадру на модуль вместо трёх — было 18 транзакций на инициализацию, стало 6.
@@ -805,7 +809,14 @@ class Channel(threading.Thread):
         # Публикуем широко — для разбора по логам: ускорения, гироскоп, магнитометр, углы, кватернионы.
         # Датчик стоит не на каждом борту -> после SENSOR_GIVEUP неудач замолкаем.
         sen=getattr(self,"sensor",SENSOR_FALLBACK)
-        if not sen.get("enabled",True) or self.sensor_gone: return True
+        if not sen.get("enabled",True): return True
+        if self.sensor_gone:
+            # Признан отсутствующим — но не навсегда: переспрашиваем раз в SENSOR_RETRY_PERIOD.
+            # Одна транзакция в пять минут ничего не стоит, а датчик, подключённый позже
+            # или переживший провал связи, возвращается сам.
+            now=time.monotonic()
+            if now-self._sen_probe < SENSOR_RETRY_PERIOD: return True
+            self._sen_probe=now
         addr=int(sen.get("address",14))
         # Читаем КОРОТКИЙ блок 0x34..0x40. Раньше читался один блок из 33 регистров: он тащил
         # 16 неиспользуемых регистров (0x41..0x50) только чтобы одной транзакцией достать
@@ -816,16 +827,19 @@ class Channel(threading.Thread):
         r=self.read_regs(addr,3,IMU_BASE,IMU_SHORT,tries=1,stats=False)
         if r is None:
             self.sensor_fails+=1
-            if self.sensor_fails>=SENSOR_GIVEUP:
-                self.sensor_gone=True
-                # Пометку НЕ снимаем: опрос выключен, значения застыли. Раньше здесь стоял
-                # puberr(c,"") и course выглядел живым, хотя его уже никто не обновлял.
-                for c in IMU_PUB: self.puberr(c,"r")
-                print("[%s] датчик (адрес %d) не отвечает %d раз -> опрос выключен для этого борта, значения застыли"%(self.name,addr,self.sensor_fails),flush=True)
-            else:
-                for c in IMU_PUB: self.puberr(c,"r")
+            for c in IMU_PUB: self.puberr(c,"r")
+            # «Датчика нет» — вывод сильный, и делать его можно ТОЛЬКО про тот, который не
+            # отвечал ни разу. 25.08 драйвер объявил отсутствующим датчик, отвечавший минутой
+            # раньше: хватило трёх потерянных кадров подряд при RSSI −57. Если он отвечал —
+            # он стоит, и мы просто показываем ошибку чтения, как у любого устройства.
+            if not self.sensor_seen and self.sensor_fails>=SENSOR_GIVEUP and not self.sensor_gone:
+                self.sensor_gone=True; self._sen_probe=time.monotonic()
+                print("[%s] датчик (адрес %d) не ответил ни разу за %d попыток -> считаю, что его на борту нет; "
+                      "переспрошу через %.0f с"%(self.name,addr,self.sensor_fails,SENSOR_RETRY_PERIOD),flush=True)
             return False
-        self.sensor_fails=0
+        if self.sensor_gone:
+            print("[%s] датчик (адрес %d) ответил -> опрос возобновлён"%(self.name,addr),flush=True)
+        self.sensor_gone=False; self.sensor_seen=True; self.sensor_fails=0
         g=lambda i: s16(r[i])
         for i,ax in enumerate("xyz"):
             self.pub("accel_"+ax,round(g(IMU_ACC+i)*ACC_SCALE,3))
