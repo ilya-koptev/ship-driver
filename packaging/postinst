@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+# Migrate from a manual install if present (old paths)
+if [ -f /etc/systemd/system/ship-driver.service ]; then rm -f /etc/systemd/system/ship-driver.service; fi
+if [ -f /usr/local/bin/ship-driver.py ]; then rm -f /usr/local/bin/ship-driver.py; fi
+systemctl daemon-reload || true
+systemctl enable ship-driver.service || true
+systemctl restart ship-driver.service || true
+# let wb-mqtt-confed pick up the settings schema (web config editor)
+systemctl try-restart wb-mqtt-confed.service || true
+# Устройства драйвера обязаны быть в ACL брокера: публикация в тему вне ACL для MQTT 3.1.1
+# = отключение клиента, после чего драйвер молча ходит по кругу переподключений (в журнале
+# mosquitto это «Quota exceeded»). Дописываем недостающие строки, ничего не удаляя.
+ACL=/etc/mosquitto/acl/ship.conf
+if [ -f "$ACL" ]; then
+  for d in ship_setup ship_diag ship_bus pwm_setup; do
+    grep -q "/devices/$d/" "$ACL" || echo "topic readwrite /devices/$d/#" >> "$ACL"
+  done
+  systemctl reload mosquitto 2>/dev/null || true
+fi
+# reload wb-rules so the ship bus switch (virtual device) appears
+systemctl try-restart wb-rules.service || true
+exit 0

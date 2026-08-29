@@ -1,0 +1,7 @@
+pkg/
+repo/
+*.deb
+Packages*
+Release
+__pycache__/
+*.pyc

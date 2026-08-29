@@ -1,0 +1,65 @@
+name: build-and-publish-apt
+# Builds the .deb and publishes a (flat) apt repository to GitHub Pages on every push to main.
+# Bump VERSION before pushing so `apt upgrade` sees a newer package.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev apt-utils
+
+      - name: Build .deb
+        run: |
+          set -e
+          VER=$(cat VERSION | tr -d '[:space:]')
+          ROOT=pkg
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/lib/systemd/system" "$ROOT/usr/share/doc/ship-driver" "$ROOT/etc" "$ROOT/etc/wb-rules" "$ROOT/usr/share/wb-mqtt-confed/schemas"
+          sed "s/@VERSION@/$VER/" packaging/control > "$ROOT/DEBIAN/control"
+          cp packaging/postinst packaging/prerm packaging/postrm packaging/conffiles "$ROOT/DEBIAN/"
+          chmod 0755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/prerm" "$ROOT/DEBIAN/postrm"
+          install -m 0755 ship-driver.py "$ROOT/usr/bin/ship-driver.py"
+          install -m 0644 ship-driver.service "$ROOT/lib/systemd/system/ship-driver.service"
+          install -m 0644 ship-driver.conf "$ROOT/etc/ship-driver.conf"
+          install -m 0644 packaging/wb-rules/ship-bus-switch.js "$ROOT/etc/wb-rules/ship-bus-switch.js"
+          install -m 0644 packaging/wb-rules/ship-diag.js "$ROOT/etc/wb-rules/ship-diag.js"
+          install -m 0755 packaging/ship-collect-logs "$ROOT/usr/bin/ship-collect-logs"
+          install -m 0644 ship-driver.schema.json "$ROOT/usr/share/wb-mqtt-confed/schemas/ship-driver.schema.json"
+          install -m 0644 README.md "$ROOT/usr/share/doc/ship-driver/README.md"
+          dpkg-deb -Zgzip --build --root-owner-group "$ROOT" "ship-driver_${VER}_all.deb"   # gzip: installable on older dpkg (WB7/bullseye), not just zstd (WB8/trixie)
+
+      - name: Build flat apt repo
+        run: |
+          set -e
+          mkdir -p repo
+          cp ship-driver_*_all.deb repo/
+          cd repo
+          dpkg-scanpackages -m . > Packages
+          gzip -9c Packages > Packages.gz
+          apt-ftparchive release . > Release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

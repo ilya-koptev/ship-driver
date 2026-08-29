@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  systemctl stop ship-driver.service || true
+  systemctl disable ship-driver.service || true
+fi
+exit 0
