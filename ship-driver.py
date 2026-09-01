@@ -211,6 +211,7 @@ SAIL_TIMEOUT=M["rates"]["sail_timeout_s"]; OFFLINE_FAILS=M["rates"]["offline_fai
 SEARCH_PERIOD=M["rates"]["search_period"]; SERVICE_PERIOD=M["rates"]["service_period"]
 SENSOR_GIVEUP=int(M["rates"].get("sensor_giveup",10))   # столько неудач подряд БЕЗ ЕДИНОГО ответа -> считаем, что датчика на борту нет
 SENSOR_RETRY_PERIOD=float(M["rates"].get("sensor_retry_s",60.0))   # как часто переспрашивать признанный отсутствующим
+SENSOR_TRIES=int(M["rates"].get("sensor_tries",2))   # попыток на чтение датчика: 1 = без повтора
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
 COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
@@ -955,7 +956,16 @@ class Channel(threading.Thread):
         # чтения 33 регистров, из них 435 (90 %) сразу лечились чтением 13 — то есть дело было в
         # длине, а не в датчике. Каждый отказ стоил 4 транзакции по ~810 мс = ~3.2 с занятого
         # канала, из-за чего мигали красным и посторонние контролы.
-        r=self.read_regs(addr,3,IMU_BASE,IMU_SHORT,tries=1,stats=False)
+        # Повтор нужен потому, что кадр датчика САМЫЙ ДЛИННЫЙ на шине (13 регистров,
+        # 31 байт ответа), а до 01.09 он был ещё и единственным без второй попытки —
+        # на просевшем канале он отваливался первым. Замер 01.09 на борту 7 при
+        # RSSI −55: за 90 минут 23 промаха по датчику против 30 у ИБП и 28 у pwm,
+        # то есть теряется весь обмен поровну, но у остальных промах лечится повтором
+        # молча, а у датчика становился видимым отказом.
+        # Цена, названная и принятая: каждый неответ теперь занимает канал ещё на
+        # ~310 мс. Команду это не задерживает — read_regs разбирает очередь между
+        # попытками.
+        r=self.read_regs(addr,3,IMU_BASE,IMU_SHORT,tries=SENSOR_TRIES,stats=False)
         if r is None:
             self.sensor_fails+=1
             for c in IMU_PUB: self.puberr(c,"r")
@@ -985,6 +995,9 @@ class Channel(threading.Thread):
         now=time.monotonic()                       # кватернионы — своим коротким чтением и редко
         if now-self._q_at>=IMU_Q_PERIOD:
             self._q_at=now
+            # Кватернионы читаются раз в минуту и нужны для разбора, а не оператору,
+            # поэтому повтора им не даём: пропущенная минута ничего не стоит, а канал
+            # занимать незачем. Замер 01.09: 3 промаха за 90 минут против 23 у блока.
             q=self.read_regs(addr,3,IMU_Q_BASE,4,tries=1,stats=False)
             if q is not None:
                 for i in range(4): self.pub("q%d"%i,round(s16(q[i])*Q_SCALE,4))
