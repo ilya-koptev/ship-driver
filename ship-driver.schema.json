@@ -1991,11 +1991,7 @@
               }
             },
             "required": [
-              "address",
-              "channel",
-              "motors",
-              "sensor",
-              "lights"
+              "address"
             ],
             "options": {
               "collapsed": true
