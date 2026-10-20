@@ -96,7 +96,7 @@ DEFAULTS={
    "CHARGING":{"current":5,"temp":10,"charge":20,"pwm_readback":30,"freq_check":10,"course":10},
    "SAILING": {"current":2,"temp":60,"charge":60,"pwm_readback":30,"freq_check":10,"course":1},
    "IDLE":    {"current":5,"temp":60,"charge":60,"pwm_readback":60,"freq_check":10,"course":10},
-   "sail_timeout_s":30.0, "offline_fails":2, "read_tries":2, "tx_gap_ms":0,
+   "sail_timeout_s":30.0, "offline_fails":2, "read_tries":2, "write_tries":3, "write_tries_stop":6, "tx_gap_ms":0,
    "search_period":0.05, "service_period":1.0},
  "enabled_at_start":{"mod1":True,"mod2":True,"mod3":True,"mod4":True},
  },
@@ -213,6 +213,14 @@ SENSOR_GIVEUP=int(M["rates"].get("sensor_giveup",10))   # столько неу�
 SENSOR_RETRY_PERIOD=float(M["rates"].get("sensor_retry_s",60.0))   # как часто переспрашивать признанный отсутствующим
 SENSOR_TRIES=int(M["rates"].get("sensor_tries",2))   # попыток на чтение датчика: 1 = без повтора
 READ_TRIES=int(M["rates"].get("read_tries",2)); READ_RETRY_GAP=0.04   # 1 повтор по умолчанию; пауза перед повтором, чтобы опоздавший кадр не столкнулся
+# Попытки ЗАПИСИ. Разбор 20.10: за 1 ч 54 мин 145 строк «ЗАПИСЬ НЕ ПРОШЛА», то есть
+# 290 потерянных кадров при двух попытках. Потерянная команда газа = борт идёт с разным
+# газом на бортах (доворот), потерянный ноль = мотор остаётся на последнем газе.
+WRITE_TRIES=int(M["rates"].get("write_tries",3))
+# Останов настойчивее обычной команды: цена лишней попытки — доли секунды, цена
+# непрошедшего нуля — неуправляемый борт.
+WRITE_TRIES_STOP=int(M["rates"].get("write_tries_stop",6))
+WRITE_RETRY_GAP=0.04   # пауза перед повтором записи: раньше повтор шёл вплотную, опоздавший кадр мог столкнуться с ним
 TX_GAP=max(0.0,float(M["rates"].get("tx_gap_ms",0))/1000.0)   # пауза ПЕРЕД каждой транзакцией: даёт модему домолчать/переключить TX-RX (0 = как было)
 COMMS_WIN=300.0   # окно скользящих счётчиков связи, с
 UPS_QUIET_AFTER=int(M["rates"].get("ups_quiet_after",3))          # столько неответов ИБП подряд -> опрашивать его редко
@@ -307,6 +315,7 @@ BOAT_TELE=(("battery_current","A","Battery current"),("battery_temperature","°C
            ("charge_setpoint","mA","Charge current setpoint"),("read_failures","","Read failures (5 min)"),
            ("err_timeout","","Errors: no reply (5 min)"),("err_frame","","Errors: framing/CRC (5 min)"),
            ("retry_fixed","","Fixed by retry (5 min)"),("lat_p95","ms","Read latency p95"),
+           ("write_retry_fixed","","Writes fixed by retry (5 min)"),("write_failures","","Write failures (5 min)"),
            ("course","°","Course (yaw)"),("roll","°","Roll"),("pitch","°","Pitch"),
            ("gyro_x","°/s","Gyro X"),("gyro_y","°/s","Gyro Y"),("gyro_z","°/s","Turn rate (gyro Z)"),
            ("accel_x","g","Accel X"),("accel_y","g","Accel Y"),("accel_z","g","Accel Z"),
@@ -316,13 +325,13 @@ BOAT_TELE=(("battery_current","A","Battery current"),("battery_temperature","°C
 # Борт кочует между радиоточками, поэтому историю физики надо вести ПО КОРАБЛЮ. boat1..4 при этом не меняется —
 # это внешний API (сторонний софт, ACL), shipN лишь ДОПОЛНИТЕЛЬНАЯ копия тех же значений.
 # Радиометрики (RSSI, счётчики связи, link_score) на корабль НЕ уходят: они про антенну берега и её эфир, а не про борт.
-SHIP_RADIO_ONLY={"rssi","comms_errors","link_quality","link_score","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"}
+SHIP_RADIO_ONLY={"rssi","comms_errors","link_quality","link_score","read_failures","err_timeout","err_frame","retry_fixed","lat_p95","write_retry_fixed","write_failures"}
 SHIP_TELE=tuple(t for t in BOAT_TELE if t[0] not in SHIP_RADIO_ONLY)
 SHIP_CMD=MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume"]   # это уходит на точку как есть
 SHIP_CTL=["radio_point","active"]   # управление на уровне БОРТА: где стоит и занимает ли точку
 SHIP_MIRROR=set(["mode"]+[t[0] for t in SHIP_TELE]+SHIP_CMD)
 SHIP_CONTROLS=["radio_point","active","mode"]+[t[0] for t in SHIP_TELE]+SHIP_CMD   # для сноса устройства при остановке
-BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","charge_setpoint","read_failures","err_timeout","err_frame","retry_fixed","lat_p95"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
+BOAT_CONTROLS=["enabled","mode","battery_current","battery_temperature","charge_level","battery_voltage","input_voltage","rssi","comms_errors","link_quality","link_score","charge_setpoint","read_failures","err_timeout","err_frame","retry_fixed","lat_p95","write_retry_fixed","write_failures"]+IMU_PUB+MOTOR_NAMES+LIGHT_NAMES+["mp3_track","mp3_volume","ship_number"]
 BOAT_EXTRA=[c for c in BOAT_CONTROLS if c not in ("enabled","mode","ship_number")]   # shown only while polling (online); removed in SEARCH/OFF
 SETUP_CONTROLS=["ship_number","LoRa_address","LoRa_channel","LoRa_freq","LoRa_grkch","LoRa_air_rate","LoRa_power","LoRa_lbt","LoRa_uart","LoRa_subpacket","LoRa_rssi_ambient","LoRa_rssi_byte","LoRa_mode","LoRa_wor","LoRa_version","LoRa_raw","LoRa_default","LoRa_read","LoRa_apply","LoRa_status"]   # ship_setup dashboard controls (for teardown on shutdown)
 
@@ -387,6 +396,7 @@ class Channel(threading.Thread):
         self._rd_fail=[]                    # отказы ПОСЛЕ всех ретраев — «настоящие» ошибки, видимые оператору
         self._rd_kind={"to":[],"short":[],"crc":[],"hdr":[]}   # подписи отказа: to=ничего не пришло (похоже на радио), остальные=фрейминг/тайминги
         self._rd_retry_ok=[]                # промахи, вылеченные повтором (подпись тайминга, не фединга)
+        self._wr_retry_ok=[]; self._wr_fail=[]   # записи, вылеченные повтором, и записи, не прошедшие после ВСЕХ попыток
         self._lat=[]                        # (t, мс) латентность успешных чтений
         # True при старте процесса: своего прошлого состояния мы не знаем (self.motor нулевой), а ESC надо взвести —
         # значит первый выход на связь = полный init_ship. Иначе resume_ship записал бы нули как «желаемый» газ.
@@ -525,17 +535,24 @@ class Channel(threading.Thread):
             sd=self.sdev()
             if sd: self.drv.mqtt.publish("/devices/%s/controls/%s/meta/error"%(sd,ctrl),err,retain=True)
 
-    def wr(self,slave,addr,val,ctrl=None):
+    def wr(self,slave,addr,val,ctrl=None,tries=None):
         """Запись с проверкой результата. Раньше возврат write_reg игнорировался,
         и команда на молчащий модуль публиковалась как применённая — оператор видел
         газ, которого в железе нет (проверено 24.08: back_right=45 висел минуту при
-        полностью мёртвом модуле 11)."""
-        for _ in (1,2):
+        полностью мёртвом модуле 11).
+        Попыток WRITE_TRIES (останов — WRITE_TRIES_STOP), между ними пауза: повтор
+        вплотную мог столкнуться с опоздавшим кадром предыдущей попытки."""
+        lim=max(1,int(tries or WRITE_TRIES))
+        for attempt in range(lim):
+            if attempt: time.sleep(WRITE_RETRY_GAP)
+            if self.ser is None: return False          # канал закрыли командой enabled=0
             if self.write_reg(slave,addr,val):
                 if ctrl: self.puberr(ctrl,"")
+                if attempt: self._wr_retry_ok.append(time.monotonic())   # «вылечено повтором» — для разбора качества линка
                 return True
-        print("[%s] ЗАПИСЬ НЕ ПРОШЛА: slave=%d reg=%d val=%d%s"
-              %(self.name,slave,addr,val," (%s)"%ctrl if ctrl else ""),flush=True)
+        self._wr_fail.append(time.monotonic())
+        print("[%s] ЗАПИСЬ НЕ ПРОШЛА: slave=%d reg=%d val=%d%s после %d попыток"
+              %(self.name,slave,addr,val," (%s)"%ctrl if ctrl else "",lim),flush=True)
         if ctrl: self.puberr(ctrl,"w")
         return False
 
@@ -550,8 +567,8 @@ class Channel(threading.Thread):
             # явный холостой импульс («минимум», регулятор исполняет его сразу), и только
             # через STOP_IDLE_S гасим выход. Заодно покой выглядит одинаково, откуда бы в
             # него ни пришли: частота холостого ставится здесь же.
-            self.wr(slave,FREQ_REG[ch],thr_freq(1),ctrl)
-            ok=self.wr(slave,DUTY_REG[ch],MOTOR_DUTY,ctrl)
+            self.wr(slave,FREQ_REG[ch],thr_freq(1),ctrl,tries=WRITE_TRIES_STOP)
+            ok=self.wr(slave,DUTY_REG[ch],MOTOR_DUTY,ctrl,tries=WRITE_TRIES_STOP)
             self.cut[(slave,ch)]=[time.monotonic()+STOP_IDLE_S,ctrl,STOP_TRIES]
             return ok
         if not self.wr(slave,FREQ_REG[ch],thr_freq(t),ctrl): return False
@@ -573,13 +590,18 @@ class Channel(threading.Thread):
             # Ползунок газа 0..THR_MAX. Дробные значения принимаем: железо различает
             # ~2.4 мкс, то есть примерно четверть деления, и терять это незачем.
             s,c=self.motor_map[ctrl]; want=max(0.0,min(THR_MAX,fv))
-            if not self.online:
+            # Ноль — это ОСТАНОВ, его отклонять нельзя: 20.10 оператор жал стоп, а драйвер
+            # отвечал «борт не на связи» и даже не пытался отправить. Газ при этом по-прежнему
+            # отклоняем (иначе resume_ship выдал бы его в железо до арминга ESC — рывок).
+            if not self.online and (want>0 or self.ser is None):
                 # раньше команда тут молча исчезала. Отказ теперь ЯВНЫЙ, но желаемое
                 # в self.motor НЕ пишем: иначе resume_ship на реконнекте выдал бы этот
                 # газ в железо до арминга ESC (рывок), а decide() показал бы SAILING.
                 is_cmd=False; self.puberr(ctrl,"w"); self.pub(ctrl,thr_fmt(self.motor.get(ctrl,INIT_MOTOR)))
                 print("[%s] команда ОТКЛОНЕНА: %s=%g, борт не на связи (%s)"%(self.name,ctrl,want,self.mode),flush=True)
             else:
+                if not self.online:
+                    print("[%s] %s=0 без связи: останов всё равно отправляю (%s)"%(self.name,ctrl,self.mode),flush=True)
                 prev=self.motor.get(ctrl,INIT_MOTOR)
                 self.motor[ctrl]=want; self.pub(ctrl,thr_fmt(want)); self.set_thr(s,c,want,prev,ctrl)
         elif ctrl==MORSE_CH and MORSE_CH in self.light_map:
@@ -839,6 +861,8 @@ class Channel(threading.Thread):
         self._rd_miss=[t for t in self._rd_miss if t>=cut]
         self._rd_fail=[t for t in self._rd_fail if t>=cut]
         self._rd_retry_ok=[t for t in self._rd_retry_ok if t>=cut]
+        self._wr_retry_ok=[t for t in self._wr_retry_ok if t>=cut]
+        self._wr_fail=[t for t in self._wr_fail if t>=cut]
         for k in self._rd_kind: self._rd_kind[k]=[t for t in self._rd_kind[k] if t>=cut]
         self._lat=[(t,v) for (t,v) in self._lat if t>=cut]
         errs=len(self._rd_miss); att=len(self._rd_att)
@@ -848,6 +872,10 @@ class Channel(threading.Thread):
         self.pub("err_timeout",len(self._rd_kind["to"]))                                    # «радийная» подпись
         self.pub("err_frame",len(self._rd_kind["short"])+len(self._rd_kind["hdr"])+len(self._rd_kind["crc"]))  # фрейминг/тайминги/искажение
         self.pub("retry_fixed",len(self._rd_retry_ok))
+        # Потери ЗАПИСИ раньше были видны только в журнале — чтобы их увидеть, 20.10
+        # пришлось выкачивать архив с контроллера. Теперь они на вкладке борта.
+        self.pub("write_retry_fixed",len(self._wr_retry_ok))
+        self.pub("write_failures",len(self._wr_fail))
         lat=None
         if self._lat:
             v=sorted(x for _,x in self._lat)
@@ -1063,10 +1091,17 @@ class Channel(threading.Thread):
                 nm=self.motor_at(s,i+1)
                 if nm is None: continue
                 t=self.motor.get(nm,0)
-                if t>0 and f!=thr_freq(t):
+                # Газ несёт ЧАСТОТА, поэтому эта сверка — единственное, что лечит потерянную
+                # запись газа. Раньше условие было «t>0», то есть при нулевом газе проверки не
+                # было ВООБЩЕ: потерянная запись холостой частоты не чинилась никогда и мотор
+                # оставался на последнем газе (разбор 20.10, «корабль кружится на месте»).
+                # В покое железо обязано держать холостую частоту: её пишет set_thr при нуле,
+                # её же ставит init_ship. Поэтому сверяем с thr_freq(max(t,1)) всегда.
+                want_f=thr_freq(max(t,1))
+                if f!=want_f:
                     # Частота в полосе, но не наша: газ в железе не тот, что задан. Хозяин — драйвер.
-                    print("[%s] %s: в железе %d Гц, задано %d Гц (газ %g) -> переписываю"%(self.name,nm,f,thr_freq(t),t),flush=True)
-                    self.wr(s,FREQ_REG[i+1],thr_freq(t),nm)
+                    print("[%s] %s: в железе %d Гц, должно быть %d Гц (газ %g) -> переписываю"%(self.name,nm,f,want_f,t),flush=True)
+                    self.wr(s,FREQ_REG[i+1],want_f,nm,tries=WRITE_TRIES_STOP if t<=0 else None)
         return True
     def module_fault(self,slave):
         """Модуль не отвечает совсем: его каналы неуправляемы, идти с этим нельзя.

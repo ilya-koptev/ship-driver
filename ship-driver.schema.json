@@ -429,6 +429,24 @@
               "minimum": 1,
               "propertyOrder": 6
             },
+            "write_tries": {
+              "type": "integer",
+              "title": "Попыток записи (газ, свет)",
+              "description": "Потерянная запись газа = борт идёт с разным газом на бортах, то есть доворачивает. Цена лишней попытки — время ответа (resp_timeout_s) занятого канала.",
+              "default": 3,
+              "minimum": 1,
+              "maximum": 10,
+              "propertyOrder": 6.1
+            },
+            "write_tries_stop": {
+              "type": "integer",
+              "title": "Попыток записи при остановке",
+              "description": "Останов настойчивее обычной команды: непрошедший ноль оставляет мотор на последнем газе.",
+              "default": 6,
+              "minimum": 1,
+              "maximum": 20,
+              "propertyOrder": 6.2
+            },
             "tx_gap_ms": {
               "type": "integer",
               "title": "Пауза перед транзакцией, мс (0 = без паузы)",
