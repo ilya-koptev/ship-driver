@@ -13,7 +13,7 @@
 # history is kept per SHIP, not per radio point; radio metrics stay on boatN. boatN is unchanged —
 # it is the external API. NOTE: every device must be listed in /etc/mosquitto/acl/ship.conf, or the
 # broker drops our connection on the first publish (MQTT 3.1.1 has no way to report a denied publish).
-import time, threading, queue, json, os, re, signal, socket, math
+import time, threading, queue, json, os, re, signal, socket, math, traceback
 import serial
 import paho.mqtt.client as mqtt
 
@@ -1137,67 +1137,79 @@ class Channel(threading.Thread):
             if m==OFF: gpio_set(self.gpio,1)   # disabled -> put MOD modem into config mode (off-air)
 
     def run(self):
+        # Поток канала не должен умирать молча: 22.10.2026 он упал на исключении, служба
+        # осталась active, а команды на boatN 15 часов копились в очереди без обработки.
         while True:
-            self.drain()
-            if not self.enabled:
-                self.set_mode(OFF); time.sleep(0.5); continue
-            self.open()
-            if not self.lora_read:                         # at start: read modem settings once (read-only, never auto-write)
-                self.lora_op(None); self.lora_read=True
-            now=time.monotonic()
-            if not self.online:
-                self.set_mode(SEARCH)
-                if self.poll_current() or self.pwm_alive():
-                    dt=now-getattr(self,"offline_since",now)
-                    self.fails=0; self.online=True; self.due={}   # due={} -> re-poll all groups at once on (re)connect
-                    self.drv.boat_controls(self,True)             # restore full dashboard before init/poll fills values
-                    if self.pwm_kept_state() and not self.force_init:   # провал связи (не смена корабля), модули живы -> НЕ сбрасываем газ
-                        print("[%s] снова на связи после %.1f с (провал связи, питание не терялось) -> восстанавливаю газ без init"%(self.name,dt),flush=True)
-                        self.resume_ship()
-                    else:                                              # смена корабля ИЛИ ребут модуля -> полный init (сброс в холостой + переарм)
-                        print("[%s] снова на связи после %.1f с (%s) -> init_ship"%(self.name,dt,"смена корабля" if self.force_init else "модуль ребутнулся"),flush=True)
-                        self.init_ship(); self.last_cmd=0.0
-                    self.force_init=False
-                    self.set_mode(self.decide())
-                    self.drv.bind_ship(self)   # борт тут реально есть -> закрепляем привязку борт<->точка
-                else: time.sleep(SEARCH_PERIOD)
-                continue
-            self.set_mode(self.decide())
-            if not getattr(self,"_warned_groups",False):   # tolerate confs from older versions (renamed/removed poll groups)
-                unknown=sorted({g for r in RATES.values() for g in r if g not in self.GROUPS})
-                if unknown: print("[%s] игнорирую незнакомые группы опроса в conf: %s"%(self.name,unknown),flush=True)
-                self._warned_groups=True
-            did=False
-            for g,per in RATES[self.mode].items():
-                fn=self.GROUPS.get(g)
-                if fn is None: continue                     # unknown group -> skip, don't crash the channel thread
-                if now>=self.due.get(g,0):
-                    ok=getattr(self,fn)(); self.due[g]=now+per; did=True
-                    # Команда не должна ждать конца телеметрии. Один неответ = 2 попытки по ~810 мс,
-                    # то есть до 1.6 с занятого канала, а очередь раньше разбиралась только в начале
-                    # цикла. Замер 25.08: на стенде без ИБП газ приходил с медианой 844 мс и до 2.2 с,
-                    # на борту с живым ИБП — 159 мс.
-                    self.drain()
-                    if g=="current":
-                        if ok:
-                            self.ups_quiet=0
-                        else:
-                            self.ups_quiet=getattr(self,"ups_quiet",0)+1
-                            if self.ups_quiet==UPS_QUIET_AFTER:
-                                print("[%s] ИБП (адрес %d) не ответил %d раз -> опрашиваю его раз в %.0f с, "
-                                      "чтобы он не занимал канал (на голове ИБП может не стоять)"
-                                      %(self.name,UPS,self.ups_quiet,UPS_QUIET_PERIOD),flush=True)
-                            if self.ups_quiet>=UPS_QUIET_AFTER: self.due[g]=now+UPS_QUIET_PERIOD
-                        if ok or self.pwm_alive(): self.fails=0   # UPS may be off; ship still alive if any pwm8a04 answers
-                        else:
-                            self.fails+=1
-                            print("[%s] промах связи #%d (UPS и все pwm не ответили)"%(self.name,self.fails),flush=True)
-                            if self.fails>=OFFLINE_FAILS:
-                                print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
-                                self.offline_since=now; self.online=False; self.set_mode(SEARCH)
-            self.cut_step()     # добить останов: погасить выход после холостого импульса
-            self.morse_step()   # такт морзянки: один регистр, ничего не блокирует
-            if not did: time.sleep(0.05)   # холостой шаг: 0.2 с добавляли столько же к задержке команды
+            try:
+                self.step()
+            except Exception:
+                print("[%s] ОШИБКА в цикле канала, продолжаю:\n%s"%(self.name,traceback.format_exc()),flush=True)
+                self.close(); self.online=False; time.sleep(1.0)
+    def step(self):
+        self.drain()
+        if not self.enabled:
+            self.set_mode(OFF); time.sleep(0.5); return
+        self.open()
+        if not self.lora_read:                         # at start: read modem settings once (read-only, never auto-write)
+            self.lora_op(None); self.lora_read=True
+        now=time.monotonic()
+        if not self.online:
+            self.set_mode(SEARCH)
+            if self.poll_current() or self.pwm_alive():
+                dt=now-getattr(self,"offline_since",now)
+                self.fails=0; self.online=True; self.due={}   # due={} -> re-poll all groups at once on (re)connect
+                self.drv.boat_controls(self,True)             # restore full dashboard before init/poll fills values
+                if self.pwm_kept_state() and not self.force_init:   # провал связи (не смена корабля), модули живы -> НЕ сбрасываем газ
+                    print("[%s] снова на связи после %.1f с (провал связи, питание не терялось) -> восстанавливаю газ без init"%(self.name,dt),flush=True)
+                    self.resume_ship()
+                else:                                              # смена корабля ИЛИ ребут модуля -> полный init (сброс в холостой + переарм)
+                    print("[%s] снова на связи после %.1f с (%s) -> init_ship"%(self.name,dt,"смена корабля" if self.force_init else "модуль ребутнулся"),flush=True)
+                    self.init_ship(); self.last_cmd=0.0
+                self.force_init=False
+                self.set_mode(self.decide())
+                self.drv.bind_ship(self)   # борт тут реально есть -> закрепляем привязку борт<->точка
+            else: time.sleep(SEARCH_PERIOD)
+            return
+        self.set_mode(self.decide())
+        if not getattr(self,"_warned_groups",False):   # tolerate confs from older versions (renamed/removed poll groups)
+            unknown=sorted({g for r in RATES.values() for g in r if g not in self.GROUPS})
+            if unknown: print("[%s] игнорирую незнакомые группы опроса в conf: %s"%(self.name,unknown),flush=True)
+            self._warned_groups=True
+        did=False
+        for g,per in RATES[self.mode].items():
+            fn=self.GROUPS.get(g)
+            if fn is None: continue                     # unknown group -> skip, don't crash the channel thread
+            if now>=self.due.get(g,0):
+                ok=getattr(self,fn)(); self.due[g]=now+per; did=True
+                # Команда не должна ждать конца телеметрии. Один неответ = 2 попытки по ~810 мс,
+                # то есть до 1.6 с занятого канала, а очередь раньше разбиралась только в начале
+                # цикла. Замер 25.08: на стенде без ИБП газ приходил с медианой 844 мс и до 2.2 с,
+                # на борту с живым ИБП — 159 мс.
+                self.drain()
+                # Команда из очереди могла выключить точку: порт закрыт, ser=None. Опрашивать
+                # дальше по этому кругу нечем — 22.10.2026 именно так упал поток mod1.
+                if not self.enabled or self.ser is None: break
+                if g=="current":
+                    if ok:
+                        self.ups_quiet=0
+                    else:
+                        self.ups_quiet=getattr(self,"ups_quiet",0)+1
+                        if self.ups_quiet==UPS_QUIET_AFTER:
+                            print("[%s] ИБП (адрес %d) не ответил %d раз -> опрашиваю его раз в %.0f с, "
+                                  "чтобы он не занимал канал (на голове ИБП может не стоять)"
+                                  %(self.name,UPS,self.ups_quiet,UPS_QUIET_PERIOD),flush=True)
+                        if self.ups_quiet>=UPS_QUIET_AFTER: self.due[g]=now+UPS_QUIET_PERIOD
+                    if ok or self.pwm_alive(): self.fails=0   # UPS may be off; ship still alive if any pwm8a04 answers
+                    else:
+                        self.fails+=1
+                        print("[%s] промах связи #%d (UPS и все pwm не ответили)"%(self.name,self.fails),flush=True)
+                        if self.fails>=OFFLINE_FAILS:
+                            print("[%s] -> offline после %d промахов, ухожу в SEARCH"%(self.name,self.fails),flush=True)
+                            self.offline_since=now; self.online=False; self.set_mode(SEARCH)
+        if not self.enabled or self.ser is None: return   # выключили посреди круга — писать некуда
+        self.cut_step()     # добить останов: погасить выход после холостого импульса
+        self.morse_step()   # такт морзянки: один регистр, ничего не блокирует
+        if not did: time.sleep(0.05)   # холостой шаг: 0.2 с добавляли столько же к задержке команды
 
 class ModbusTCP:
     # Modbus-RTU framed over a transparent TCP serial-gateway (e.g. EBYTE): same RTU frames + CRC16, sent over a socket.
